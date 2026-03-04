@@ -34,29 +34,7 @@ jobs:
       - name: Get iDrive version
         id: version
         run: ./idrive/version.sh
-
-      - name: Check for new base image
-        if: github.event_name != 'push'
-        id: check-base
-        uses: lucacome/docker-image-update-checker@v2.0.0
-        with:
-          base-image: debian:bookworm-slim
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
-
-      - name: Check for new iDrive version
-        if: github.event_name != 'push'
-        id: check-version
-        uses: tyriis/docker-image-tag-exists@v2.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          repository: ${{ env.IMAGE_LOWERCASE }}
-          tag: ${{ steps.version.outputs.idrive_version }}
-
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v3
-
-      # New Step: Safely evaluate secrets and output a boolean flag
+      
       - name: Check DockerHub Secrets
         id: check-secrets
         env:
@@ -76,13 +54,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Now legally evaluates the boolean output from the check-secrets step
       - name: Login to DockerHub
         if: steps.check-secrets.outputs.has_secrets == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --- NEW: Check if the image currently exists in the registry ---
+      - name: Check if image exists in GHCR
+        id: check-image
+        if: github.event_name != 'push'
+        run: |
+          # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- UPDATED: Only run update checkers if the image already exists ---
+      - name: Check for new base image
+        if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
+        id: check-base
+        uses: lucacome/docker-image-update-checker@v2.0.0
+        with:
+          base-image: debian:bookworm-slim
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
+
+      - name: Check for new iDrive version
+        if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
+        id: check-version
+        uses: tyriis/docker-image-tag-exists@v2.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          repository: ${{ env.IMAGE_LOWERCASE }}
+          tag: ${{ steps.version.outputs.idrive_version }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Generate Dynamic Docker Tags
         id: generate-tags
@@ -102,8 +113,13 @@ jobs:
           echo -e "$TAGS" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
 
+      # --- UPDATED: Trigger build if push, base update, version update, OR missing image ---
       - name: Build image and push
-        if: github.event_name == 'push' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found'
+        if: >
+          github.event_name == 'push' || 
+          steps.check-image.outputs.exists == 'false' || 
+          steps.check-base.outputs.needs-updating == 'true' || 
+          steps.check-version.outputs.tag == 'not found'
         uses: docker/build-push-action@v6
         with:
           context: idrive/build
