@@ -1,38 +1,56 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Set Timezone from $TZ environment variable
-if [ "$TZ" ]; then
-  # Check if timezone exists in /usr/share/zoneinfo folder
-  if [ -f "/usr/share/zoneinfo/$TZ" ]; then
-    # create /etc/localtime link
-    if ln -sf /usr/share/zoneinfo/$TZ /etc/localtime; then
-      dpkg-reconfigure -f noninteractive tzdata
-    fi
-  fi
-fi
+echo "Initializing IDrive container..."
 
-# Copy binaries in /opt/IDriveForLinux/idriveIt.orig to original location
-cp -a /opt/IDriveForLinux/idriveIt.orig/idevsutil* /opt/IDriveForLinux/idriveIt/
+# 1. Volume Initialization
+# Extract missing files from the backup archive; bypass existing configuration files.
+tar -xzf /tmp/idriveIt.orig.tar.gz -C /opt/IDriveForLinux --skip-old-files
 
-# Entrypoint for idrive
-echo "iDrive start.."
-
-# Handler
+# 2. Process Management & Signal Trapping
 exit_handler() {
-  echo "iDrive stop..."
-  exit 0
+    echo "Termination signal received. Shutting down IDrive services..."
+    if [ -n "${cron_pid:-}" ] && kill -0 "$cron_pid" 2>/dev/null; then
+        kill -TERM "$cron_pid"
+        echo "IDrive CRON service stopped."
+    fi
+    exit 0
 }
 
-# Exit trap
-trap 'kill ${!}; exit_handler' EXIT
+trap 'exit_handler' SIGTERM SIGINT EXIT
 
-# Start IDrive CRON in background
-/etc/idrivecron --cron 1>/dev/null 2>/dev/null &
-pid="$!"
+# 3. Start IDrive CRON Service
+echo "Starting IDrive CRON service..."
+/etc/idrivecron --cron >/dev/null 2>&1 &
+cron_pid=$!
 
-# Persist till Signal
-while true
-do
-  tail -f /dev/null & wait $!
+# 4. Base Daemon Log Discovery & Tailing
+BASE_LOG_DIR="/opt/IDriveForLinux/idriveIt/user_profile/root/.trace"
+BASE_LOG="${BASE_LOG_DIR}/traceLog.txt"
+
+echo "Tailing base daemon log: $BASE_LOG"
+tail -F "$BASE_LOG" &
+
+# 5. Authenticated User Log Discovery & Tailing
+echo "Polling for authenticated user log generation..."
+USER_LOG=""
+
+while true; do
+    # -mindepth 3 strictly filters out the base daemon log at Depth 2.
+    # It dynamically captures: root/<any_username>/.trace/traceLog.txt
+    found=$(find /opt/IDriveForLinux/idriveIt/user_profile/root -mindepth 3 -type f -name "traceLog.txt" 2>/dev/null | head -n 1)
+    
+    if [ -n "$found" ]; then
+        USER_LOG="$found"
+        break
+    fi
+    sleep 5
 done
 
+echo "Tailing authenticated user log: $USER_LOG"
+tail -F "$USER_LOG" &
+
+# 6. Process Blocking
+# The wait command without arguments blocks indefinitely, keeping PID 1 alive 
+# to ensure Docker signals trigger the trap sequence.
+wait
