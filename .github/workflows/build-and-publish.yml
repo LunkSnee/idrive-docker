@@ -9,66 +9,103 @@ on:
     - cron: "12 9 * * *"
   workflow_dispatch:
 
+env:
+  # GitHub Container Registry (GHCR) is the standard for forked repositories.
+  REGISTRY: ghcr.io
+  # Captures the dynamic repository name (e.g., your-username/idrive-docker)
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   build-and-push-docker-image:
     name: Build Docker image and push to repositories
     runs-on: ubuntu-latest
+    
+    # Explicitly grant permissions to push packages to GHCR.
+    # Without this, forks will fail with an HTTP 403 Unauthorized error.
+    permissions:
+      contents: read
+      packages: write
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # GHCR strictly requires lowercase image names. This step sanitizes the repository 
+      # name to prevent failures if your GitHub username contains capital letters.
+      - name: Sanitize Repository Name
+        id: sanitize
+        run: |
+          echo "IMAGE_LOWERCASE=$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Get iDrive version
+        id: version
+        run: ./idrive/version.sh
+
+      # Updated to target the debian:bookworm-slim image we optimized in the Dockerfile.
       - name: Check for new base image
         if: github.event_name != 'push'
         id: check-base
         uses: lucacome/docker-image-update-checker@v2.0.0
         with:
-          base-image: ubuntu:24.04
-          image: snorre0815/idrive-docker:latest
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get iDrive version
-        id: version
-        run: ./idrive/version.sh
+          base-image: debian:bookworm-slim
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
 
       - name: Check for new iDrive version
         if: github.event_name != 'push'
         id: check-version
         uses: tyriis/docker-image-tag-exists@v2.1.0
         with:
-          registry: ghcr.io
-          repository: ${{ github.repository }}
+          registry: ${{ env.REGISTRY }}
+          repository: ${{ env.IMAGE_LOWERCASE }}
           tag: ${{ steps.version.outputs.idrive_version }}
 
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Login to Github Packages (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is natively available in all repos/forks without manual secret creation.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Conditionally attempt Docker Hub login ONLY if the user has explicitly added the secrets.
+      # This prevents the workflow from immediately failing on forks.
       - name: Login to DockerHub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Login to Github Packages
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # Dynamically constructs the list of tags based on available registries and secrets.
+      - name: Generate Dynamic Docker Tags
+        id: generate-tags
+        run: |
+          # Initialize with standard GHCR tags
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
+          TAGS="$TAGS\n${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
+          
+          # Append Docker Hub tags if the username secret is populated
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            TAGS="$TAGS\n${{ secrets.DOCKERHUB_USERNAME }}/idrive-docker:latest"
+            TAGS="$TAGS\n${{ secrets.DOCKERHUB_USERNAME }}/idrive-docker:${{ steps.version.outputs.idrive_version }}"
+          fi
+          
+          # Use multi-line output syntax for GitHub Actions
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "tags<<$EOF" >> $GITHUB_OUTPUT
+          echo -e "$TAGS" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
 
-      - name: Build image and push to Docker Hub and GitHub Container Registry
+      - name: Build image and push
         if: github.event_name == 'push' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found'
         uses: docker/build-push-action@v6
         with:
-          # relative path to the place where source code with Dockerfile is located
           context: idrive/build
-          # Note: tags has to be all lower-case
-          tags: |
-            snorre0815/idrive-docker:latest
-            snorre0815/idrive-docker:${{ steps.version.outputs.idrive_version }}
-            ghcr.io/snorre-k/idrive-docker:latest
-            ghcr.io/snorre-k/idrive-docker:${{ steps.version.outputs.idrive_version }}
-          # build on feature branches, push only on main branch
+          # Ingests the dynamically generated list of tags from the previous step
+          tags: ${{ steps.generate-tags.outputs.tags }}
           push: ${{ github.ref == 'refs/heads/main' }}
-          # multiarch: amd64 and arm64
           platforms: linux/amd64,linux/arm64
