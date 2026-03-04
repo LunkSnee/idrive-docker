@@ -1,7 +1,7 @@
 services:
   idrive:
     build: ./idrive/build/
-    image: snorre0815/idrive-docker:latest
+    image: ghcr.io/lunksnee/idrive-docker:latest
     container_name: idrive
     volumes:
       - idrive:/opt/IDriveForLinux/idriveIt
