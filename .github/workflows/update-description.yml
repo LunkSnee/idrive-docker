@@ -5,32 +5,36 @@ on:
     branches: [main]
     paths:
       - "README.md"
-      # Using a wildcard accounts for both .yml and .yaml file extensions
       - ".github/workflows/update-description.y*ml"
 
 jobs:
   dockerHubDescription:
     name: Update Description on DockerHub
     runs-on: ubuntu-latest
-    
-    # Gracefully skip this entire job if the executing repository (like a fork)
-    # has not configured Docker Hub secrets. This prevents red "X" failure badges.
-    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
 
     steps:
-      # Updated to v4 for compatibility with newer Node.js runtime environments
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Updated to v4 to ensure compliance with the latest Docker Hub API changes
+      # Evaluate the presence of secrets first
+      - name: Check DockerHub Secrets
+        id: check-secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Execute the update ONLY if the boolean output is true
       - name: Update dockerhub repo description
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          # Dynamically builds the target repository path using the provided secret
-          # rather than relying on a hardcoded namespace.
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/idrive-docker
           short-description: ${{ github.event.repository.description }}
-          # The action automatically looks for README.md in the workspace root
-          # so explicitly defining the readme-filepath is unnecessary.
