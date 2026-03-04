@@ -1,27 +1,36 @@
 name: Update Docker Hub Description
 
 on:
-  # run it on push to the default repository branch
   push:
     branches: [main]
     paths:
       - "README.md"
-      - ".github/workflows/update-description.yml"
+      # Using a wildcard accounts for both .yml and .yaml file extensions
+      - ".github/workflows/update-description.y*ml"
 
 jobs:
   dockerHubDescription:
     name: Update Description on DockerHub
     runs-on: ubuntu-latest
+    
+    # Gracefully skip this entire job if the executing repository (like a fork)
+    # has not configured Docker Hub secrets. This prevents red "X" failure badges.
+    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
 
-    # steps to perform in job
     steps:
+      # Updated to v4 for compatibility with newer Node.js runtime environments
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
+      # Updated to v4 to ensure compliance with the latest Docker Hub API changes
       - name: Update dockerhub repo description
-        uses: peter-evans/dockerhub-description@v2
+        uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: snorre0815/idrive-docker
+          # Dynamically builds the target repository path using the provided secret
+          # rather than relying on a hardcoded namespace.
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/idrive-docker
           short-description: ${{ github.event.repository.description }}
+          # The action automatically looks for README.md in the workspace root
+          # so explicitly defining the readme-filepath is unnecessary.
