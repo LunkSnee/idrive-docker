@@ -94,20 +94,27 @@ jobs:
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
-
+      
       - name: Generate Dynamic Docker Tags
         id: generate-tags
         env:
           DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
-          TAGS="$TAGS\n${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
-          
+      
+          # Append registry version tag ONLY if the version was detected
+          if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
+            TAGS="$TAGS\n${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
+          fi
+      
+          # Append DockerHub tags only if DockerHub secrets are present
           if [ "${{ steps.check-secrets.outputs.has_secrets }}" == "true" ]; then
             TAGS="$TAGS\n$DOCKER_USER/idrive-docker:latest"
-            TAGS="$TAGS\n$DOCKER_USER/idrive-docker:${{ steps.version.outputs.idrive_version }}"
+            if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
+              TAGS="$TAGS\n$DOCKER_USER/idrive-docker:${{ steps.version.outputs.idrive_version }}"
+            fi
           fi
-          
+      
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "tags<<$EOF" >> $GITHUB_OUTPUT
           echo -e "$TAGS" >> $GITHUB_OUTPUT
