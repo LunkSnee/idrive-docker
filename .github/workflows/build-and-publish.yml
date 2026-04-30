@@ -30,6 +30,8 @@ jobs:
 
       - name: Sanitize Repository Name
         id: sanitize
+        env:
+          RAW_IMAGE_NAME: ${{ github.repository }}
         run: |
           echo "IMAGE_LOWERCASE=$(echo $RAW_IMAGE_NAME | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
@@ -129,7 +131,7 @@ jobs:
           steps.check-image.outputs.exists == 'false' || 
           steps.check-base.outputs.needs-updating == 'true' || 
           steps.check-version.outputs.tag == 'not found'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: idrive/build
           tags: ${{ steps.generate-tags.outputs.tags }}
