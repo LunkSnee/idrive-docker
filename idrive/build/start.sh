@@ -5,7 +5,26 @@ echo "Initializing IDrive container..."
 
 # 1. Volume Initialization
 # Extract missing files from the backup archive; bypass existing configuration files.
-tar -xzf /tmp/idriveIt.orig.tar.gz -C /opt/IDriveForLinux --skip-old-files
+if [ -f /tmp/idriveIt.orig.tar.gz ]; then
+    tar -xzf /tmp/idriveIt.orig.tar.gz -C /opt/IDriveForLinux --skip-old-files 2>/dev/null || true
+    tar -xzf /tmp/idriveIt.orig.tar.gz -C /opt/IDriveForLinux --overwrite idriveIt/idevsutil idriveIt/idevsutil_dedup 2>/dev/null || true
+fi
+
+# 1b. Record IDrive client version into the idriveIt folder.
+# Try to parse a semantic version like "3.12.0" from the output of the idrive binary.
+ver="unknown"
+if [ -x "/opt/IDriveForLinux/bin/idrive" ]; then
+    ver_raw=$(/opt/IDriveForLinux/bin/idrive --version 2>/dev/null || true)
+    # Extract first occurrence of a semantic version number
+    ver_parsed=$(printf "%s" "$ver_raw" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)
+    if [ -n "$ver_parsed" ]; then
+        ver="$ver_parsed"
+    fi
+fi
+# Ensure the idriveIt directory exists (volume may be empty) and write the version files.
+printf '%s\n' "$ver" > /opt/IDriveForLinux/idriveIt/cache/.updateVersionInfo
+printf '%s' "$ver" > /opt/IDriveForLinux/idriveIt/cache/version
+
 
 # 2. Process Management & Signal Trapping
 exit_handler() {
