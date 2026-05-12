@@ -71,7 +71,8 @@ jobs:
         if: github.event_name != 'push'
         run: |
           # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
-          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest > /dev/null 2>&1; then
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
+          if docker manifest inspect "$IMAGE_REF" > /dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
@@ -108,17 +109,19 @@ jobs:
       
           # Append registry version tag ONLY if the version was detected
           if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
-            TAGS="$TAGS\n${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
+            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
           fi
-      
+
           # Append DockerHub tags only if DockerHub secrets are present
           if [ "${{ steps.check-secrets.outputs.has_secrets }}" == "true" ]; then
-            TAGS="$TAGS\n$DOCKER_USER/idrive-docker:latest"
+            TAGS="$TAGS,$DOCKER_USER/idrive-docker:latest"
             if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
-              TAGS="$TAGS\n$DOCKER_USER/idrive-docker:${{ steps.version.outputs.idrive_version }}"
+              TAGS="$TAGS,$DOCKER_USER/idrive-docker:${{ steps.version.outputs.idrive_version }}"
             fi
           fi
-      
+    
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+    
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "tags<<$EOF" >> $GITHUB_OUTPUT
           echo -e "$TAGS" >> $GITHUB_OUTPUT
