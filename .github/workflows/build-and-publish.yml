@@ -20,7 +20,7 @@ jobs:
         id: check-base
         uses: lucacome/docker-image-update-checker@v2.0.0
         with:
-          base-image: ubuntu:24.04
+          base-image: ubuntu:26.04
           image: snorre0815/idrive-docker:latest
 
       - name: Checkout code
