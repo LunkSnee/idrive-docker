@@ -14,51 +14,77 @@ jobs:
     name: Build Docker image and push to repositories
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      packages: write
+
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0
+
+      - name: Get iDrive version
+        id: version
+        run: |
+          chmod +x ./idrive/version.sh
+          ./idrive/version.sh
+
       - name: Check for new base image
         if: github.event_name != 'push'
         id: check-base
-        uses: lucacome/docker-image-update-checker@v2.0.0
+        uses: lucacome/docker-image-update-checker@v3.1
         with:
           base-image: ubuntu:26.04
           image: snorre0815/idrive-docker:latest
 
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get iDrive version
-        id: version
-        run: ./idrive/version.sh
-
       - name: Check for new iDrive version
         if: github.event_name != 'push'
         id: check-version
-        uses: tyriis/docker-image-tag-exists@v2.1.0
+        uses: tyriis/docker-image-tag-exists@v2.1
         with:
           registry: ghcr.io
           repository: ${{ github.repository }}
           tag: ${{ steps.version.outputs.idrive_version }}
 
+      - name: Determine if build is needed
+        id: should-build
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "reason=push event" >> $GITHUB_OUTPUT
+            echo "build=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.check-base.outputs.needs-updating }}" == "true" ]]; then
+            echo "reason=base image update available" >> $GITHUB_OUTPUT
+            echo "build=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.check-version.outputs.tag }}" == "not found" ]]; then
+            echo "reason=new iDrive version available" >> $GITHUB_OUTPUT
+            echo "build=true" >> $GITHUB_OUTPUT
+          else
+            echo "reason=no updates available" >> $GITHUB_OUTPUT
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Docker Buildx
+        if: steps.should-build.outputs.build == 'true'
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.1
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        if: steps.should-build.outputs.build == 'true' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4.2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to Github Packages
-        uses: docker/login-action@v3
+        if: steps.should-build.outputs.build == 'true' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4.2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image and push to Docker Hub and GitHub Container Registry
-        if: github.event_name == 'push' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found'
-        uses: docker/build-push-action@v6
+        if: steps.should-build.outputs.build == 'true'
+        uses: docker/build-push-action@v7.2
         with:
           # relative path to the place where source code with Dockerfile is located
           context: idrive/build
@@ -72,3 +98,10 @@ jobs:
           push: ${{ github.ref == 'refs/heads/main' }}
           # multiarch: amd64 and arm64
           platforms: linux/amd64,linux/arm64
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Reason:** ${{ steps.should-build.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Status:** ${{ steps.should-build.outputs.build }}" >> $GITHUB_STEP_SUMMARY
