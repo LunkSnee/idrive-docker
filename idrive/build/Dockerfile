@@ -21,10 +21,10 @@ RUN apt-get update && apt-get -y upgrade && apt-get -y install \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Get & Setup IDrive
-RUN curl -O https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin && \
+RUN curl -o idriveforlinux.bin $[IDRIVE_URL} && \
     chmod +x idriveforlinux.bin && \
     bash -c 'export TERM=xterm; echo -ne "A\n" | /idriveforlinux.bin --install; exit 0' && \
-    rm /idriveforlinux.bin && \
+    rm idriveforlinux.bin && \
     ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron
 
 # Touch IDrive crontab on volume & link it to /etc
