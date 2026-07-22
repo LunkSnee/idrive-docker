@@ -1,5 +1,11 @@
 FROM ubuntu:26.04
 
+# URL of iDrive script package with fallback URL
+ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/linux-bin/idriveforlinux.bin
+
+# use nearest archive mirrors
+RUN sed -i 's|http://ubuntu.com|mirror://://ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+
 # Install packages
 RUN apt-get update && apt-get -y upgrade && apt-get -y install \
       locales-all \

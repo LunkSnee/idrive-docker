@@ -88,6 +88,7 @@ jobs:
         with:
           # relative path to the place where source code with Dockerfile is located
           context: idrive/build
+          build-args: IDRIVE_URL=${{ steps.version.outputs.idrive_URL }}
           # Note: tags has to be all lower-case
           tags: |
             snorre0815/idrive-docker:latest
