@@ -20,10 +20,10 @@ RUN apt-get update && apt-get -y upgrade && apt-get -y install \
       python3 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Get & Setup IDrive
+# Get & Setup IDrive - export LD_LIBRARY_PATH for ARM installs
 RUN curl -o idriveforlinux.bin ${IDRIVE_URL} && \
     chmod +x idriveforlinux.bin && \
-    bash -c 'export TERM=xterm; echo -ne "A\n" | /idriveforlinux.bin --install; exit 0' && \
+    bash -c 'export TERM=xterm; export LD_LIBRARY_PATH="/opt/IDriveForLinux/bin/Idrivelib/dependencies/python/lib"; echo -ne "A\n" | /idriveforlinux.bin --install; exit 0' && \
     rm idriveforlinux.bin && \
     ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron
 
