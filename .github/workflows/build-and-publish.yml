@@ -37,10 +37,6 @@ jobs:
 
       - name: Get iDrive version
         id: version
-        # Don't let a version-check outage skip base-image checks and the build below;
-        # the failure still shows up as a warning on this step, and downstream steps
-        # already guard on idrive_version/idrive_URL being empty.
-        continue-on-error: true
         run: ./idrive/version.sh
 
       - name: Prepare build args
