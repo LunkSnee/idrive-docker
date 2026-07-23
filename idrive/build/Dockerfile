@@ -2,7 +2,7 @@
 FROM debian:bookworm-slim
 
 # URL of the iDrive script package, with a fallback if the version-check couldn't resolve one.
-ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin
+ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/linux-bin/idriveforlinux.bin
 
 # Consolidate all environment variables into a single layer.
 # PYTHONDONTWRITEBYTECODE prevents Python from generating .pyc files on disk at runtime.
