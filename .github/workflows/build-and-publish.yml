@@ -39,17 +39,6 @@ jobs:
         id: version
         run: ./idrive/version.sh
 
-      - name: Prepare build args
-        id: build-args
-        run: |
-          # Only pass IDRIVE_URL if the version-check resolved one; otherwise the
-          # Dockerfile's own ARG default is used.
-          if [ -n "${{ steps.version.outputs.idrive_URL }}" ]; then
-            echo "args=IDRIVE_URL=${{ steps.version.outputs.idrive_URL }}" >> $GITHUB_OUTPUT
-          else
-            echo "args=" >> $GITHUB_OUTPUT
-          fi
-
       - name: Check DockerHub Secrets
         id: check-secrets
         env:
@@ -150,7 +139,9 @@ jobs:
         with:
           context: idrive/build
           tags: ${{ steps.generate-tags.outputs.tags }}
-          build-args: ${{ steps.build-args.outputs.args }}
+          # Passed as a buildkit input (not evaluated by a runner shell). version.sh
+          # exits non-zero if the URL is unresolved, so we never reach here empty.
+          build-args: IDRIVE_URL=${{ steps.version.outputs.idrive_URL }}
           push: ${{ github.ref == 'refs/heads/main' }}
           platforms: linux/amd64,linux/arm64
 
