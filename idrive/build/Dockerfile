@@ -1,6 +1,9 @@
 # Specify the exact, minimal base image
 FROM debian:bookworm-slim
 
+# URL of the iDrive script package, with a fallback if the version-check couldn't resolve one.
+ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin
+
 # Consolidate all environment variables into a single layer.
 # PYTHONDONTWRITEBYTECODE prevents Python from generating .pyc files on disk at runtime.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -33,7 +36,7 @@ RUN apt-get update && \
     ln -s /opt/IDriveForLinux/idriveIt/idrivecrontab.json /etc/idrivecrontab.json && \
     ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron && \
     # 5. Download the installer directly to /tmp.
-    curl -fsSL -o /tmp/idriveforlinux.bin https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin && \
+    curl -fsSL -o /tmp/idriveforlinux.bin "${IDRIVE_URL}" && \
     chmod a+x /tmp/idriveforlinux.bin && \
     # 6. Execute the installer non-interactively using the required character sequence.
     echo -en "A\n\n\n\n" | /tmp/idriveforlinux.bin --install && \
