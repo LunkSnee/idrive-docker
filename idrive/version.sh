@@ -8,18 +8,12 @@ RAW=$(curl -fsSL "$VERSION_URL" || true)
 VERSION=$(echo "$RAW" | grep -oP 'var\s+linuxScriptVersion\s*=\s*"Version\s+\K[0-9.]+(?=")' || true)
 URL=$(echo "$RAW" | grep -oP "var\s+linuxScriptPackageURL\s*=\s*'\K[^']+(?=')" || true)
 
-if [ -n "$VERSION" ]; then
-  echo "iDrive latest version: $VERSION"
-  echo "idrive_version=$VERSION" >> $GITHUB_OUTPUT
-else
-  echo "iDrive latest version: (not found)"
-  # Do NOT set idrive_version to an empty value. Leave it unset so workflow can guard on its existence.
+if [ -z "$VERSION" ] || [ -z "$URL" ]; then
+  echo "Error: iDrive latest version or download URL not found at $VERSION_URL"
+  exit 1
 fi
 
-if [ -n "$URL" ]; then
-  echo "iDrive download URL: $URL"
-  echo "idrive_URL=$URL" >> $GITHUB_OUTPUT
-else
-  echo "iDrive download URL: (not found)"
-  # Do NOT set idrive_URL to an empty value. Leave it unset so the Dockerfile's ARG default is used instead.
-fi
+echo "iDrive latest version: $VERSION"
+echo "iDrive download URL: $URL"
+echo "idrive_version=$VERSION" >> $GITHUB_OUTPUT
+echo "idrive_URL=$URL" >> $GITHUB_OUTPUT

@@ -37,6 +37,10 @@ jobs:
 
       - name: Get iDrive version
         id: version
+        # Don't let a version-check outage skip base-image checks and the build below;
+        # the failure still shows up as a warning on this step, and downstream steps
+        # already guard on idrive_version/idrive_URL being empty.
+        continue-on-error: true
         run: ./idrive/version.sh
 
       - name: Prepare build args
@@ -153,3 +157,16 @@ jobs:
           build-args: ${{ steps.build-args.outputs.args }}
           push: ${{ github.ref == 'refs/heads/main' }}
           platforms: linux/amd64,linux/arm64
+
+      - name: Build Summary
+        if: always()
+        run: |
+          {
+            echo "## Build Summary"
+            echo "**Event:** ${{ github.event_name }}"
+            echo "**iDrive version detected:** ${{ steps.version.outputs.idrive_version || 'no (version-check failed)' }}"
+            echo "**Image already exists:** ${{ steps.check-image.outputs.exists || 'n/a (push event)' }}"
+            echo "**Base image needs updating:** ${{ steps.check-base.outputs.needs-updating || 'n/a' }}"
+            echo "**Existing version tag found:** ${{ steps.check-version.outputs.tag || 'n/a' }}"
+            echo "**Built:** ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.check-image.outputs.exists == 'false' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found' }}"
+          } >> $GITHUB_STEP_SUMMARY
