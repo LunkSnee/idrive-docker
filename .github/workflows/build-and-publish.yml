@@ -118,12 +118,9 @@ jobs:
             fi
           fi
     
+          # $TAGS is a single comma-separated line, which build-push-action accepts
+          # directly — no heredoc needed.
           echo "tags=$TAGS" >> $GITHUB_OUTPUT
-    
-          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          echo "tags<<$EOF" >> $GITHUB_OUTPUT
-          echo -e "$TAGS" >> $GITHUB_OUTPUT
-          echo "$EOF" >> $GITHUB_OUTPUT
 
       # --- UPDATED: Trigger build if push, base update, version update, OR missing image ---
       - name: Build image and push

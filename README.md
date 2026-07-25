@@ -9,8 +9,9 @@ GitHub: https://github.com/LunkSnee/idrive-docker
 - IDrive account
 
 ## Build image
+The Dockerfile lives in `idrive/build/`, so build from that directory:
 ```shell
-docker build -t idrive-docker:latest .
+docker build -t idrive-docker:latest idrive/build/
 ```
 Image is tagged `idrive-docker:latest`. The image is available on GHCR. Thx to @araines, the image gets also tagged with the iDrive client version.
 - `ghcr.io/lunksnee/idrive-docker:latest`
