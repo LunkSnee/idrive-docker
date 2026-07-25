@@ -22,21 +22,31 @@ if [ -x "/opt/IDriveForLinux/bin/idrive" ]; then
     fi
 fi
 # Ensure the idriveIt directory exists (volume may be empty) and write the version files.
+mkdir -p /opt/IDriveForLinux/idriveIt/cache
 printf '%s\n' "$ver" > /opt/IDriveForLinux/idriveIt/cache/.updateVersionInfo
 printf '%s' "$ver" > /opt/IDriveForLinux/idriveIt/cache/version
 
 
 # 2. Process Management & Signal Trapping
 exit_handler() {
-    echo "Termination signal received. Shutting down IDrive services..."
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "Shutting down IDrive services..."
+    else
+        echo "IDrive container failed (exit $rc). Shutting down..."
+    fi
     if [ -n "${cron_pid:-}" ] && kill -0 "$cron_pid" 2>/dev/null; then
         kill -TERM "$cron_pid"
         echo "IDrive CRON service stopped."
     fi
-    exit 0
+    # Re-raise the real status: exiting 0 here would report a crash to Docker
+    # as a clean shutdown.
+    exit "$rc"
 }
 
-trap 'exit_handler' SIGTERM SIGINT EXIT
+# A signalled stop is a clean stop; EXIT preserves whatever status actually occurred.
+trap 'exit 0' SIGTERM SIGINT
+trap 'exit_handler' EXIT
 
 # 3. Start IDrive CRON Service
 echo "Starting IDrive CRON service..."

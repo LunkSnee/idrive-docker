@@ -9,6 +9,12 @@ on:
     - cron: "12 9 * * *"
   workflow_dispatch:
 
+# Serialize builds so a manual dispatch overlapping the daily schedule can't race
+# to push :latest, with the slower run silently winning.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}

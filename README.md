@@ -44,6 +44,12 @@ docker run -d --name idrive \
 docker compose build idrive
 docker compose up -d
 ```
+To use bind mounts for the config instead of a named volume, use
+[docker-compose-mounts.yml](/LunkSnee/idrive-docker/blob/main/docker-compose-mounts.yml)
+and adjust the `/path/to/config` mapping:
+```shell
+docker compose -f docker-compose-mounts.yml up -d
+```
 
 ## Tasks after first start
 You have to login to your IDrive account after first start.
