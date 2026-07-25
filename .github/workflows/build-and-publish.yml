@@ -15,8 +15,6 @@ env:
 
 jobs:
   build-and-push-docker-image:
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     name: Build Docker image and push to repositories
     runs-on: ubuntu-latest
     
@@ -82,7 +80,8 @@ jobs:
       - name: Check for new base image
         if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
         id: check-base
-        uses: lucacome/docker-image-update-checker@v3.1.0
+        # pinned by commit SHA (v3.1.0) — this job holds registry push credentials
+        uses: lucacome/docker-image-update-checker@3233adf42bb1dddf92f18cf024a8e202dbeaa9b3
         with:
           base-image: debian:bookworm-slim
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
@@ -90,7 +89,8 @@ jobs:
       - name: Check for new iDrive version
         if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
         id: check-version
-        uses: tyriis/docker-image-tag-exists@v2.1.0
+        # pinned by commit SHA (v2026.6.0) — v2.1.0 ran on the deprecated Node 20
+        uses: tyriis/docker-image-tag-exists@e73c8fdfab85076cdcf2ce4b443181fae2153675
         with:
           registry: ${{ env.REGISTRY }}
           repository: ${{ env.IMAGE_LOWERCASE }}
