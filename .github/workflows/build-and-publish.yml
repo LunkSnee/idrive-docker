@@ -48,6 +48,8 @@ jobs:
           RAW_IMAGE_NAME: ${{ github.repository }}
         run: |
           echo "IMAGE_LOWERCASE=$(echo $RAW_IMAGE_NAME | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          # Bare repo name (no owner), used for the image title label.
+          echo "REPO_NAME=${RAW_IMAGE_NAME#*/}" >> $GITHUB_ENV
 
       - name: Get iDrive version
         id: version
@@ -134,6 +136,9 @@ jobs:
           # directly — no heredoc needed.
           echo "tags=$TAGS" >> $GITHUB_OUTPUT
 
+          # RFC 3339 timestamp for org.opencontainers.image.created
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
       # --- UPDATED: Trigger build if push, base update, version update, OR missing image ---
       - name: Build image and push
         # A rollback dispatch only re-points a tag, so there is nothing to build.
@@ -151,6 +156,24 @@ jobs:
           # Passed as a buildkit input (not evaluated by a runner shell). version.sh
           # exits non-zero if the URL is unresolved, so we never reach here empty.
           build-args: IDRIVE_URL=${{ steps.version.outputs.idrive_URL }}
+          # OCI image labels. Everything repo-specific derives from the github context
+          # rather than being hardcoded, so a fork labels its images with its own
+          # repository instead of inheriting the upstream one.
+          #
+          # `source` is the load-bearing one: Renovate reads it from the published
+          # manifest to locate the repository, which is how a consumer's update PR
+          # gets release notes for this image. `revision` records which commit of
+          # this repo built the image, so `docker inspect` answers "which recipe is
+          # this?" even though :<version> is overwritten by later rebuilds.
+          labels: |
+            org.opencontainers.image.title=${{ env.REPO_NAME }}
+            org.opencontainers.image.description=IDrive Linux Client in a Docker container
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=GPL-3.0
+            org.opencontainers.image.version=${{ steps.version.outputs.idrive_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.generate-tags.outputs.build_date }}
           push: ${{ github.ref == 'refs/heads/main' }}
           platforms: linux/amd64,linux/arm64
 
