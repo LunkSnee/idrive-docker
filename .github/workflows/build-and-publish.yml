@@ -18,6 +18,11 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # How many days an iDrive release must have been public before :latest is moved
+  # onto it. Version tags are always published immediately; only :latest waits.
+  # iDrive has shipped a release whose bundled helper binaries disagreed with the
+  # client (3.16.0), so :latest should not follow a brand-new version same-day.
+  LATEST_MIN_AGE_DAYS: 7
 
 jobs:
   build-and-push-docker-image:
@@ -109,21 +114,17 @@ jobs:
         env:
           DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
-      
-          # Append registry version tag ONLY if the version was detected
-          if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
-            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}"
+          # Version tags only. :latest is moved separately, by the promote step below,
+          # once the release has aged past LATEST_MIN_AGE_DAYS. version.sh exits
+          # non-zero when it cannot resolve a version, so this is never empty.
+          VERSION="${{ steps.version.outputs.idrive_version }}"
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:$VERSION"
+
+          # Append the DockerHub tag only if DockerHub secrets are present
+          if [ "${{ steps.check-secrets.outputs.has_secrets }}" == "true" ]; then
+            TAGS="$TAGS,$DOCKER_USER/idrive-docker:$VERSION"
           fi
 
-          # Append DockerHub tags only if DockerHub secrets are present
-          if [ "${{ steps.check-secrets.outputs.has_secrets }}" == "true" ]; then
-            TAGS="$TAGS,$DOCKER_USER/idrive-docker:latest"
-            if [ -n "${{ steps.version.outputs.idrive_version }}" ]; then
-              TAGS="$TAGS,$DOCKER_USER/idrive-docker:${{ steps.version.outputs.idrive_version }}"
-            fi
-          fi
-    
           # $TAGS is a single comma-separated line, which build-push-action accepts
           # directly — no heredoc needed.
           echo "tags=$TAGS" >> $GITHUB_OUTPUT
@@ -146,6 +147,55 @@ jobs:
           push: ${{ github.ref == 'refs/heads/main' }}
           platforms: linux/amd64,linux/arm64
 
+      # Moving :latest is deliberately separate from building, so a version built
+      # days ago can still be promoted once it has aged — the build step above does
+      # not re-run for a version whose tag already exists.
+      - name: Promote :latest
+        id: promote
+        if: github.ref == 'refs/heads/main'
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          VERSION="${{ steps.version.outputs.idrive_version }}"
+          AGE="${{ steps.version.outputs.idrive_age_days }}"
+          MIN="${{ env.LATEST_MIN_AGE_DAYS }}"
+          GHCR_REPO="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}"
+
+          skip() { echo "promoted=false" >> $GITHUB_OUTPUT; echo "reason=$1" >> $GITHUB_OUTPUT; echo "$1"; exit 0; }
+
+          # If :latest does not exist yet there is nothing to protect, so publish it
+          # regardless of age. (check-image is skipped on push events, hence the
+          # explicit 'false' test rather than a truthiness check.)
+          BOOTSTRAP=false
+          [ "${{ steps.check-image.outputs.exists }}" = "false" ] && BOOTSTRAP=true
+
+          if [ "$BOOTSTRAP" != "true" ]; then
+            # Unknown age means version.sh could not read the release date. Fail closed:
+            # leave :latest on the last known good version rather than guessing.
+            [ -z "$AGE" ] && skip "release age unknown; leaving :latest unchanged"
+            [ "$AGE" -lt "$MIN" ] && skip "$VERSION is $AGE day(s) old, waiting for $MIN"
+          fi
+
+          # :latest can only point at a manifest that is actually published.
+          docker manifest inspect "$GHCR_REPO:$VERSION" >/dev/null 2>&1 \
+            || skip "$GHCR_REPO:$VERSION is not published yet"
+
+          # Re-point the tag at the existing multi-arch manifest. No rebuild, and the
+          # amd64/arm64 manifest list is preserved.
+          docker buildx imagetools create --tag "$GHCR_REPO:latest" "$GHCR_REPO:$VERSION"
+          if [ "${{ steps.check-secrets.outputs.has_secrets }}" = "true" ]; then
+            docker buildx imagetools create \
+              --tag "$DOCKER_USER/idrive-docker:latest" "$DOCKER_USER/idrive-docker:$VERSION"
+          fi
+
+          if [ "$BOOTSTRAP" = "true" ]; then
+            echo "reason=bootstrap (:latest did not exist)" >> $GITHUB_OUTPUT
+          else
+            echo "reason=$VERSION is $AGE day(s) old (>= $MIN)" >> $GITHUB_OUTPUT
+          fi
+          echo "promoted=true" >> $GITHUB_OUTPUT
+          echo ":latest now points at $VERSION"
+
       - name: Build Summary
         if: always()
         run: |
@@ -153,8 +203,12 @@ jobs:
             echo "## Build Summary"
             echo "**Event:** ${{ github.event_name }}"
             echo "**iDrive version detected:** ${{ steps.version.outputs.idrive_version || 'no (version-check failed)' }}"
+            echo "**Release date:** ${{ steps.version.outputs.idrive_release_date || 'unknown' }} (${{ steps.version.outputs.idrive_age_days || '?' }} days old)"
             echo "**Image already exists:** ${{ steps.check-image.outputs.exists || 'n/a (push event)' }}"
             echo "**Base image needs updating:** ${{ steps.check-base.outputs.needs-updating || 'n/a' }}"
             echo "**Existing version tag found:** ${{ steps.check-version.outputs.tag || 'n/a' }}"
             echo "**Built:** ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.check-image.outputs.exists == 'false' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found' }}"
+            echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
+            echo ""
+            echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"
           } >> $GITHUB_STEP_SUMMARY
