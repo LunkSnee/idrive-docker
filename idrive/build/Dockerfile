@@ -1,6 +1,9 @@
 # Specify the exact, minimal base image
 FROM debian:bookworm-slim
 
+# OCI image labels are applied by the build workflow, not here, so they derive from
+# whichever repository builds the image and stay correct in a fork.
+
 # URL of the iDrive script package, with a fallback if the version-check couldn't resolve one.
 ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/linux-bin/idriveforlinux.bin
 
