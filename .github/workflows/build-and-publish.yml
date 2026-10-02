@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "12 9 * * *"
   workflow_dispatch:
+    inputs:
+      promote_version:
+        description: "Roll :latest back to an already-published version tag (e.g. 3.15.0). Bypasses the age gate and skips building. Leave empty for a normal run."
+        required: false
+        type: string
 
 # Serialize builds so a manual dispatch overlapping the daily schedule can't race
 # to push :latest, with the slower run silently winning.
@@ -131,12 +136,14 @@ jobs:
 
       # --- UPDATED: Trigger build if push, base update, version update, OR missing image ---
       - name: Build image and push
+        # A rollback dispatch only re-points a tag, so there is nothing to build.
         if: >
+          inputs.promote_version == '' && (
           github.event_name == 'push' ||
           github.event_name == 'workflow_dispatch' ||
           steps.check-image.outputs.exists == 'false' ||
           steps.check-base.outputs.needs-updating == 'true' ||
-          steps.check-version.outputs.tag == 'not found'
+          steps.check-version.outputs.tag == 'not found' )
         uses: docker/build-push-action@v7
         with:
           context: idrive/build
@@ -156,45 +163,54 @@ jobs:
         env:
           DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          VERSION="${{ steps.version.outputs.idrive_version }}"
-          AGE="${{ steps.version.outputs.idrive_age_days }}"
           MIN="${{ env.LATEST_MIN_AGE_DAYS }}"
           GHCR_REPO="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}"
+          REQUESTED="${{ inputs.promote_version }}"
 
           skip() { echo "promoted=false" >> $GITHUB_OUTPUT; echo "reason=$1" >> $GITHUB_OUTPUT; echo "$1"; exit 0; }
 
-          # If :latest does not exist yet there is nothing to protect, so publish it
-          # regardless of age. (check-image is skipped on push events, hence the
-          # explicit 'false' test rather than a truthiness check.)
-          BOOTSTRAP=false
-          [ "${{ steps.check-image.outputs.exists }}" = "false" ] && BOOTSTRAP=true
+          if [ -n "$REQUESTED" ]; then
+            # Explicit rollback/promotion requested by a human. Skip the age gate: the
+            # whole point is to move :latest onto a version of their choosing, which
+            # for a rollback is deliberately an older one.
+            TARGET="$REQUESTED"
+            WHY="manual rollback to $TARGET"
+          else
+            TARGET="${{ steps.version.outputs.idrive_version }}"
+            AGE="${{ steps.version.outputs.idrive_age_days }}"
 
-          if [ "$BOOTSTRAP" != "true" ]; then
-            # Unknown age means version.sh could not read the release date. Fail closed:
-            # leave :latest on the last known good version rather than guessing.
-            [ -z "$AGE" ] && skip "release age unknown; leaving :latest unchanged"
-            [ "$AGE" -lt "$MIN" ] && skip "$VERSION is $AGE day(s) old, waiting for $MIN"
+            # If :latest does not exist yet there is nothing to protect, so publish it
+            # regardless of age. (check-image is skipped on push events, hence the
+            # explicit 'false' test rather than a truthiness check.)
+            BOOTSTRAP=false
+            [ "${{ steps.check-image.outputs.exists }}" = "false" ] && BOOTSTRAP=true
+
+            if [ "$BOOTSTRAP" = "true" ]; then
+              WHY="bootstrap (:latest did not exist)"
+            else
+              # Unknown age means version.sh could not read the release date. Fail closed:
+              # leave :latest on the last known good version rather than guessing.
+              [ -z "$AGE" ] && skip "release age unknown; leaving :latest unchanged"
+              [ "$AGE" -lt "$MIN" ] && skip "$TARGET is $AGE day(s) old, waiting for $MIN"
+              WHY="$TARGET is $AGE day(s) old (>= $MIN)"
+            fi
           fi
 
           # :latest can only point at a manifest that is actually published.
-          docker manifest inspect "$GHCR_REPO:$VERSION" >/dev/null 2>&1 \
-            || skip "$GHCR_REPO:$VERSION is not published yet"
+          docker manifest inspect "$GHCR_REPO:$TARGET" >/dev/null 2>&1 \
+            || skip "$GHCR_REPO:$TARGET is not published; nothing to point :latest at"
 
           # Re-point the tag at the existing multi-arch manifest. No rebuild, and the
           # amd64/arm64 manifest list is preserved.
-          docker buildx imagetools create --tag "$GHCR_REPO:latest" "$GHCR_REPO:$VERSION"
+          docker buildx imagetools create --tag "$GHCR_REPO:latest" "$GHCR_REPO:$TARGET"
           if [ "${{ steps.check-secrets.outputs.has_secrets }}" = "true" ]; then
             docker buildx imagetools create \
-              --tag "$DOCKER_USER/idrive-docker:latest" "$DOCKER_USER/idrive-docker:$VERSION"
+              --tag "$DOCKER_USER/idrive-docker:latest" "$DOCKER_USER/idrive-docker:$TARGET"
           fi
 
-          if [ "$BOOTSTRAP" = "true" ]; then
-            echo "reason=bootstrap (:latest did not exist)" >> $GITHUB_OUTPUT
-          else
-            echo "reason=$VERSION is $AGE day(s) old (>= $MIN)" >> $GITHUB_OUTPUT
-          fi
           echo "promoted=true" >> $GITHUB_OUTPUT
-          echo ":latest now points at $VERSION"
+          echo "reason=$WHY" >> $GITHUB_OUTPUT
+          echo ":latest now points at $TARGET ($WHY)"
 
       - name: Build Summary
         if: always()
@@ -207,7 +223,7 @@ jobs:
             echo "**Image already exists:** ${{ steps.check-image.outputs.exists || 'n/a (push event)' }}"
             echo "**Base image needs updating:** ${{ steps.check-base.outputs.needs-updating || 'n/a' }}"
             echo "**Existing version tag found:** ${{ steps.check-version.outputs.tag || 'n/a' }}"
-            echo "**Built:** ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.check-image.outputs.exists == 'false' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found' }}"
+            echo "**Built:** ${{ inputs.promote_version == '' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.check-image.outputs.exists == 'false' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found') }}"
             echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
             echo ""
             echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"
