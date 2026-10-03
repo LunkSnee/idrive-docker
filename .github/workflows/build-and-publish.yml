@@ -28,6 +28,15 @@ env:
   # iDrive has shipped a release whose bundled helper binaries disagreed with the
   # client (3.16.0), so :latest should not follow a brand-new version same-day.
   LATEST_MIN_AGE_DAYS: 7
+  # Versions :latest must never be promoted onto, regardless of age. The age gate
+  # above only *delays* a release; it cannot know one is broken, so a known-bad
+  # version would sail through once it aged past the threshold.
+  #
+  # 3.16.0: the client invokes its own bundled idevsutil with a --cmd option that
+  # helper rejects, so every backup fails. Reproduces on a fresh container with an
+  # empty config — see snorre-k/idrive-docker#35. Remove the entry once iDrive
+  # ships a fix. Space-separated.
+  BLOCKED_VERSIONS: "3.16.0"
 
 jobs:
   build-and-push-docker-image:
@@ -222,6 +231,14 @@ jobs:
           # :latest can only point at a manifest that is actually published.
           docker manifest inspect "$GHCR_REPO:$TARGET" >/dev/null 2>&1 \
             || skip "$GHCR_REPO:$TARGET is not published; nothing to point :latest at"
+
+          # Known-bad releases are refused even for an explicit request, so a typo
+          # cannot put :latest back onto a version that breaks every backup. To
+          # promote one deliberately, remove it from BLOCKED_VERSIONS.
+          for bad in ${{ env.BLOCKED_VERSIONS }}; do
+            [ "$TARGET" = "$bad" ] && \
+              skip "$TARGET is listed in BLOCKED_VERSIONS; refusing to promote :latest onto a known-broken release"
+          done
 
           # Re-point the tag at the existing multi-arch manifest. No rebuild, and the
           # amd64/arm64 manifest list is preserved.
