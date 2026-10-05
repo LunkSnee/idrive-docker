@@ -22,21 +22,15 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
   # How many days an iDrive release must have been public before :latest is moved
-  # onto it. Version tags are always published immediately; only :latest waits.
-  # iDrive has shipped a release whose bundled helper binaries disagreed with the
-  # client (3.16.0), so :latest should not follow a brand-new version same-day.
+  # onto it. Version tags are always published immediately; only :latest waits, so a
+  # release that turns out to be bad does not reach :latest users on day one.
   LATEST_MIN_AGE_DAYS: 7
   # Versions :latest must never be promoted onto, regardless of age. The age gate
-  # above only *delays* a release; it cannot know one is broken, so a known-bad
-  # version would sail through once it aged past the threshold.
-  #
-  # 3.16.0: the client invokes its own bundled idevsutil with a --cmd option that
-  # helper rejects, so every backup fails. Reproduces on a fresh container with an
-  # empty config — see snorre-k/idrive-docker#35. Remove the entry once iDrive
-  # ships a fix. Space-separated.
-  BLOCKED_VERSIONS: "3.16.0"
+  # above only *delays* a release; it cannot know one is broken, so a version known
+  # to be bad would sail through once it aged past the threshold. Space-separated,
+  # e.g. "3.21.0 3.22.0". Commas do NOT work -- the value is split on whitespace.
+  BLOCKED_VERSIONS: ""
 
 jobs:
   build-and-push-docker-image:
@@ -52,7 +46,6 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Sanitize Repository Name
-        id: sanitize
         env:
           RAW_IMAGE_NAME: ${{ github.repository }}
         run: |
@@ -109,7 +102,7 @@ jobs:
         id: check-base
         uses: lucacome/docker-image-update-checker@3233adf42bb1dddf92f18cf024a8e202dbeaa9b3 # v3.1.0
         with:
-          base-image: debian:bookworm-slim
+          base-image: debian:trixie-slim
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
 
       - name: Check for new iDrive version
@@ -122,7 +115,6 @@ jobs:
           tag: ${{ steps.version.outputs.idrive_version }}
 
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v4
       
       - name: Generate Dynamic Docker Tags
@@ -148,16 +140,32 @@ jobs:
           # RFC 3339 timestamp for org.opencontainers.image.created
           echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
-      # --- UPDATED: Trigger build if push, base update, version update, OR missing image ---
+      # Single source of truth for the build decision; the Build Summary below reads
+      # the same outputs rather than restating the condition.
+      - name: Decide whether to build
+        id: decide
+        env:
+          REQUESTED: ${{ inputs.promote_version }}
+          EVENT: ${{ github.event_name }}
+          IMAGE_EXISTS: ${{ steps.check-image.outputs.exists }}
+          BASE_STALE: ${{ steps.check-base.outputs.needs-updating }}
+          VERSION_TAG: ${{ steps.check-version.outputs.tag }}
+        run: |
+          build=false
+          if   [ -n "$REQUESTED" ];            then reason="rollback request; nothing to build"
+          elif [ "$EVENT" = "push" ];          then build=true; reason="push to idrive/build"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then build=true; reason="manual dispatch"
+          elif [ "$IMAGE_EXISTS" = "false" ];  then build=true; reason="image does not exist yet"
+          elif [ "$BASE_STALE" = "true" ];     then build=true; reason="base image updated"
+          elif [ "$VERSION_TAG" = "not found" ]; then build=true; reason="new iDrive version"
+          else reason="no updates available"
+          fi
+          echo "build=$build"   >> $GITHUB_OUTPUT
+          echo "reason=$reason" >> $GITHUB_OUTPUT
+          echo "build=$build ($reason)"
+
       - name: Build image and push
-        # A rollback dispatch only re-points a tag, so there is nothing to build.
-        if: >
-          inputs.promote_version == '' && (
-          github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' ||
-          steps.check-image.outputs.exists == 'false' ||
-          steps.check-base.outputs.needs-updating == 'true' ||
-          steps.check-version.outputs.tag == 'not found' )
+        if: steps.decide.outputs.build == 'true'
         uses: docker/build-push-action@v7
         with:
           context: idrive/build
@@ -263,7 +271,7 @@ jobs:
             echo "**Image already exists:** ${{ steps.check-image.outputs.exists || 'n/a (push event)' }}"
             echo "**Base image needs updating:** ${{ steps.check-base.outputs.needs-updating || 'n/a' }}"
             echo "**Existing version tag found:** ${{ steps.check-version.outputs.tag || 'n/a' }}"
-            echo "**Built:** ${{ inputs.promote_version == '' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.check-image.outputs.exists == 'false' || steps.check-base.outputs.needs-updating == 'true' || steps.check-version.outputs.tag == 'not found') }}"
+            echo "**Built:** ${{ steps.decide.outputs.build || 'n/a' }} — ${{ steps.decide.outputs.reason || 'step did not run' }}"
             echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
             echo ""
             echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"

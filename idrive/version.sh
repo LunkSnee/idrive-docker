@@ -3,8 +3,10 @@ set -eo pipefail
 
 VERSION_URL="https://www.idrivedownloads.com/downloads/linux/download-for-linux/version-linux.js"
 
-# Try to extract the script version and its (cache-busted) download URL. Use curl -f to fail gracefully if unreachable.
-RAW=$(curl -fsSL "$VERSION_URL" || true)
+# Extract the script version and its (cache-busted) download URL. curl -f makes an
+# unreachable or erroring endpoint fail here, with curl's own diagnostic, rather than
+# surfacing later as a confusing "not found".
+RAW=$(curl -fsSL "$VERSION_URL")
 VERSION=$(echo "$RAW" | grep -oP 'var\s+linuxScriptVersion\s*=\s*"Version\s+\K[0-9.]+(?=")' || true)
 URL=$(echo "$RAW" | grep -oP "var\s+linuxScriptPackageURL\s*=\s*'\K[^']+(?=')" || true)
 
@@ -19,17 +21,12 @@ echo "idrive_version=$VERSION" >> $GITHUB_OUTPUT
 echo "idrive_URL=$URL" >> $GITHUB_OUTPUT
 
 # Release date, used to hold the :latest tag back until a release has had time to
-# surface problems. iDrive has shipped releases whose bundled helper binaries
-# disagree with the client (3.16.0), so :latest should not follow a brand-new
-# version the day it appears.
+# surface problems, rather than following a brand-new version the day it appears.
 #
 # The page carries it as: var linuxScriptDate = "Released on MM/DD/YYYY";
 REL_DATE=$(echo "$RAW" | grep -oP 'var\s+linuxScriptDate\s*=\s*"Released on\s+\K[0-9]{2}/[0-9]{2}/[0-9]{4}(?=")' || true)
-REL_ISO=""
-if [ -n "$REL_DATE" ]; then
-  # MM/DD/YYYY -> YYYY-MM-DD so date(1) can read it
-  REL_ISO=$(printf '%s' "$REL_DATE" | awk -F/ '{printf "%s-%s-%s", $3, $1, $2}')
-fi
+# MM/DD/YYYY -> YYYY-MM-DD so date(1) can read it. Empty input yields empty output.
+REL_ISO=$(printf '%s' "$REL_DATE" | awk -F/ 'NF==3{printf "%s-%s-%s", $3, $1, $2}')
 
 if [ -n "$REL_ISO" ] && REL_EPOCH=$(date -u -d "$REL_ISO" +%s 2>/dev/null); then
   AGE_DAYS=$(( ( $(date -u +%s) - REL_EPOCH ) / 86400 ))
