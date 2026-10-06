@@ -4,7 +4,7 @@ set -euo pipefail
 echo "Initializing IDrive container..."
 
 # 1. Volume Initialization
-ORIG_ARCHIVE=/tmp/idriveIt.orig.tar.gz
+ORIG_ARCHIVE=/opt/IDriveForLinux/idriveIt.orig.tar.gz
 if [ -f "$ORIG_ARCHIVE" ]; then
     # Restore whatever the volume is missing (first run, or files a newer image added),
     # without disturbing existing configuration.

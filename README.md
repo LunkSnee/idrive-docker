@@ -1,15 +1,3 @@
-> [!WARNING]
-> **iDrive client 3.16.0 is broken — backups fail.** The 3.16.0 client invokes its
-> own bundled `idevsutil` helper with a `--cmd=` option that the helper does not
-> accept, so every backup aborts with
-> `Child Launch Error: idevs: --cmd=...: unknown option`. This is a defect in
-> iDrive's own release, not in this image: it reproduces on a fresh container with
-> an empty config, and all helper binaries match the ones the installer shipped.
-> See [snorre-k/idrive-docker#35](https://github.com/snorre-k/idrive-docker/issues/35).
->
-> Use the version-pinned tag `ghcr.io/lunksnee/idrive-docker:3.15.0` until iDrive
-> publishes a fix.
-
 # idrive-docker
 Run IDrive Linux Client in a docker container
 
@@ -33,7 +21,7 @@ Image is tagged `idrive-docker:latest`. The image is available on GHCR. Thx to @
 Version tags such as `:3.15.0` are published as soon as a new iDrive release is
 built. `:latest` is held back until a release has been public for
 `LATEST_MIN_AGE_DAYS` (7 by default, set in `.github/workflows/build-and-publish.yml`),
-so a broken iDrive release does not reach `:latest` users on day one. Pinning a
+so a bad iDrive release does not reach `:latest` users on day one. Pinning a
 version tag is the safest option for unattended backups, since it never moves.
 
 ## Run container with docker
