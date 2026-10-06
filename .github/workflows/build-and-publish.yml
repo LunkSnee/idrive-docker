@@ -6,7 +6,7 @@ on:
     paths:
       - "idrive/build/**"
   schedule:
-    - cron: "51 4 * * *"
+    - cron: "12 9 * * *"
   workflow_dispatch:
     inputs:
       promote_version:
