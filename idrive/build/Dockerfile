@@ -69,7 +69,8 @@ RUN apt-get update && \
     ln -s /opt/IDriveForLinux/idriveIt/idrivecrontab.json /etc/idrivecrontab.json && \
     ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron && \
     # 5. Download the installer directly to /tmp.
-    curl -fsSL -o /tmp/idriveforlinux.bin "${IDRIVE_URL}" && \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+        -o /tmp/idriveforlinux.bin "${IDRIVE_URL}" && \
     chmod a+x /tmp/idriveforlinux.bin && \
     # 6. Execute the installer non-interactively using the required character sequence.
     #    printf, not `echo -en`: RUN uses /bin/sh (dash on Debian), whose echo does
