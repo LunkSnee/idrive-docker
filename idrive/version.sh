@@ -1,6 +1,8 @@
 #!/bin/bash
 set -eo pipefail
 
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+
 VERSION_URL="https://www.idrivedownloads.com/downloads/linux/download-for-linux/version-linux.js"
 
 # Extract the script version and its (cache-busted) download URL. curl -f makes an
