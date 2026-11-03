@@ -108,7 +108,7 @@ jobs:
       - name: Check for new iDrive version
         if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
         id: check-version
-        uses: tyriis/docker-image-tag-exists@e73c8fdfab85076cdcf2ce4b443181fae2153675 # v2026.6.0
+        uses: tyriis/docker-image-tag-exists@860c74baa8acb3428353c6910b2c8e12ad1f8458 # v2026.6.0
         with:
           registry: ${{ env.REGISTRY }}
           repository: ${{ env.IMAGE_LOWERCASE }}
