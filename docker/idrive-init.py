@@ -8,6 +8,8 @@ config volume (/opt/IDriveForLinux/idriveIt) in the state IDrive expects.
 
 Commands:
   prepare      run by start.sh before IDrive starts (see cmd_prepare)
+  autologin    run by start.sh after prepare: optional automated setup and re-login
+               from credentials (see cmd_autologin)
   healthcheck  the Docker HEALTHCHECK (see cmd_healthcheck)
 
 IDrive keeps most of its state as JSON scrambled with its own encryption; the helper reads
@@ -16,17 +18,25 @@ IDrive's business.
 """
 from __future__ import annotations
 
+import base64
 import glob
+import hashlib
+import hmac
 import json
 import os
+import pty
 import re
+import select
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 BIN_DIR = "/opt/IDriveForLinux/bin"
 IDRIVE_BIN = os.path.join(BIN_DIR, "idrive")
@@ -462,6 +472,9 @@ def collect_health_state() -> tuple[bool, str]:
     if file_ver != bin_ver:
         return False, f"cache/version ({file_ver or 'missing'}) != image ({bin_ver})"
     if not is_already_initialized():
+        # With credentials configured, setup was supposed to happen at start, so it failed.
+        if credentials_configured():
+            return False, "account is not configured (automated setup failed; see docker logs)"
         return True, "waiting for account setup"
 
     user_id, logged_in = get_idriveuser_state()
@@ -502,8 +515,666 @@ def cmd_healthcheck() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------------------------
+# autologin: optional automated setup and re-login from credentials (Docker secrets)
+#
+# IDrive has no non-interactive login, so the helper runs `idrive --account-setting` (first
+# setup of an empty volume) or `idrive --login` (an existing account that is logged out)
+# in a pseudo-terminal and answers its prompts. The prompts are matched by their text, so a
+# change in IDrive's wording shows up as a failed login with the transcript in the log.
+# ---------------------------------------------------------------------------------------------
+BACKUP_LOCATION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MENU_PROMPT = r"(?:Enter your choice|Enter the\s+'?S\.No\.?'?[^\n:]*):"
+
+# IDrive output that means the login cannot succeed; seeing one stops the interaction.
+FAILURE_PATTERNS = (
+    r"Invalid username or Password",
+    r"Invalid encryption key",
+    r"failed to authenticate user",
+    r"Unable to Create Backup Location",
+    r"Unable to find your backup location",
+    r"Two-factor authentication has failed",
+    r"exceeded the number of attempts",
+    r"maximum count for receiving OTP",
+    r"RATE_LIMITER_BLOCKED",
+    r"failed to verify your account",
+    r"encryption verification failed",
+    r"failed to encode private key",
+    r"account has been (?:blocked|cancell?ed|canceled|expired)",
+    r"already logged in\. Logout using",
+)
+
+
+@dataclass
+class LoginSettings:
+    """Credentials and first-setup choices, read from the environment or secret files."""
+
+    account: str
+    password: str
+    enc_type: str  # DEFAULT or PRIVATE (first setup only)
+    enc_key: str
+    totp_spec: tuple[bytes, int, int, str] | None  # parsed authenticator setup key
+    backup_loc: str  # backup location name for first setup ("" = IDrive's default)
+    totp_raw: str  # raw TOTP secret/URI for settings fingerprinting
+    secrets: list[str]  # values to redact from any transcript that is printed
+
+
+def read_env_or_file(var_name: str) -> str:
+    """VAR_FILE (a Docker secret file) if set, else VAR. Trailing newlines are dropped."""
+    file_var = f"{var_name}_FILE"
+    secret_path = os.environ.get(file_var, "").strip()
+    if secret_path:
+        if not os.path.isfile(secret_path):
+            raise FileNotFoundError(f"{file_var} points to missing file: {secret_path}")
+        with open(secret_path, encoding="utf-8") as fh:
+            return fh.read().rstrip("\r\n")
+    return os.environ.get(var_name, "")
+
+
+def credentials_configured() -> bool:
+    """True when automated login is configured (used by the health check)."""
+    return any(
+        os.environ.get(v, "").strip()
+        for v in ("IDRIVE_ACCOUNT", "IDRIVE_ACCOUNT_FILE", "IDRIVE_PASSWORD", "IDRIVE_PASSWORD_FILE")
+    )
+
+
+def scrub(text: str, secrets: list[str]) -> str:
+    """Redact secrets and the account name (and its email parts) from text that gets printed."""
+    out = text
+    for secret in secrets:
+        if not secret:
+            continue
+        out = out.replace(secret, "<REDACTED>")
+        if "@" in secret:
+            local, domain = secret.split("@", 1)
+            out = re.sub(re.escape(secret), "<REDACTED>", out, flags=re.I)
+            if local:
+                # Whole words only, so a short local part ("bob") does not mangle unrelated text.
+                out = re.sub(rf"(?<![\w.+-]){re.escape(local)}(?![\w.+-])", "<REDACTED>", out, flags=re.I)
+            if domain:
+                out = re.sub(re.escape(f"@{domain}"), "@<REDACTED>", out, flags=re.I)
+    return out
+
+
+def strip_ansi(text: str) -> str:
+    """Remove terminal escape sequences from PTY output."""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b\([A-Za-z0-9]|\r", "", text)
+
+
+def parse_totp_secret(raw: str) -> tuple[bytes, int, int, str]:
+    """Parse a raw Base32 TOTP secret or otpauth://totp URI into (key, digits, period, algorithm)."""
+    text = raw.strip()
+    digits = 6
+    period = 30
+    algorithm = "SHA1"
+
+    if text.lower().startswith("otpauth://"):
+        parsed = urlparse(text)
+        if parsed.netloc.lower() != "totp":
+            raise ValueError("Invalid IDRIVE_TOTP_SECRET: only otpauth://totp URIs are supported.")
+        qs = parse_qs(parsed.query)
+        secret_b32 = (qs.get("secret") or [""])[0].strip()
+        if "digits" in qs and qs["digits"][0].strip():
+            try:
+                digits = int(qs["digits"][0].strip())
+            except ValueError:
+                raise ValueError("Invalid IDRIVE_TOTP_SECRET URI: invalid digits parameter.") from None
+        if "period" in qs and qs["period"][0].strip():
+            try:
+                period = int(qs["period"][0].strip())
+            except ValueError:
+                raise ValueError("Invalid IDRIVE_TOTP_SECRET URI: invalid period parameter.") from None
+        if "algorithm" in qs and qs["algorithm"][0].strip():
+            algorithm = qs["algorithm"][0].strip().upper()
+    else:
+        secret_b32 = text
+
+    if digits not in (6, 7, 8):
+        raise ValueError("Invalid IDRIVE_TOTP_SECRET: digits must be 6, 7, or 8.")
+    if period <= 0:
+        raise ValueError("Invalid IDRIVE_TOTP_SECRET: period must be positive.")
+    hash_algos = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}
+    if algorithm not in hash_algos:
+        raise ValueError("Invalid IDRIVE_TOTP_SECRET: unsupported TOTP algorithm.")
+
+    compact = re.sub(r"[\s-]+", "", secret_b32).upper()
+    if not compact:
+        raise ValueError("Invalid IDRIVE_TOTP_SECRET: secret is empty.")
+    padded = compact + ("=" * ((-len(compact)) % 8))
+    try:
+        key = base64.b32decode(padded, casefold=True)
+    except Exception:
+        raise ValueError(
+            "Invalid IDRIVE_TOTP_SECRET: expected a valid Base32 secret or otpauth://totp URI."
+        ) from None
+    if not key:
+        raise ValueError("Invalid IDRIVE_TOTP_SECRET: decoded secret key is empty.")
+    return key, digits, period, algorithm
+
+
+def generate_totp(
+    spec: tuple[bytes, int, int, str],
+    now: float | None = None,
+    min_remaining_s: float = 5.0,
+    min_counter: int | None = None,
+) -> tuple[str, int]:
+    """Generate an RFC 6238 TOTP code, avoiding expiring boundaries when reading live wall time."""
+    key, digits, period, algorithm = spec
+    hash_fn = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}[algorithm]
+
+    if now is None:
+        cur = time.time()
+        if min_counter is not None:
+            cur_counter = int(cur // period)
+            if cur_counter < min_counter:
+                wait_s = (min_counter * period) - cur + 0.5
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                cur = time.time()
+        remaining = period - (cur % period)
+        if remaining < min_remaining_s:
+            time.sleep(remaining + 0.5)
+            cur = time.time()
+    else:
+        cur = now
+
+    counter = int(cur // period)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hash_fn).digest()
+    offset = digest[-1] & 0x0F
+    code_int = (struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF) % (10**digits)
+    return f"{code_int:0{digits}d}", counter
+
+
+def _terminate_child(pid: int) -> int:
+    """Terminate and reap a spawned child PID cleanly."""
+    for sig in (15, 9):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            break
+        if sig == 15:
+            for _ in range(4):
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    if wpid == pid:
+                        return os.waitstatus_to_exitcode(status)
+                except ChildProcessError:
+                    return 0
+                time.sleep(0.1)
+    try:
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status)
+    except OSError:
+        return 1
+
+
+def pty_interact(args: list[str], handler, secrets: list[str], timeout_s: int = 180) -> tuple[int, str]:
+    """Execute `idrive <args>` under a PTY, dispatching output chunks to handler(unseen, write_fn)."""
+    cmd = [IDRIVE_BIN] + args
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execv(cmd[0], cmd)
+        except OSError:
+            os._exit(127)
+
+    unseen = ""
+    full_log: list[str] = []
+    start = time.monotonic()
+    detected_error: str | None = None
+    aborted = False
+    rc: int | None = None
+
+    def write_line(text: str) -> None:
+        time.sleep(0.2)
+        os.write(master_fd, (text + "\n").encode("utf-8"))
+
+    try:
+        while True:
+            if time.monotonic() - start > timeout_s:
+                full_log.append(f"\n[PTY TIMEOUT after {timeout_s}s]")
+                rc = 124
+                break
+
+            rlist, _, _ = select.select([master_fd], [], [], 0.5)
+            if master_fd in rlist:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+
+                txt = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                unseen += txt
+                full_log.append(txt)
+
+                for err_pat in FAILURE_PATTERNS:
+                    if re.search(err_pat, unseen, re.I):
+                        detected_error = err_pat
+                        break
+                if detected_error:
+                    # Brief drain so the full error line is captured before terminating child.
+                    drain_r, _, _ = select.select([master_fd], [], [], 0.5)
+                    if master_fd in drain_r:
+                        try:
+                            extra = os.read(master_fd, 4096)
+                            if extra:
+                                full_log.append(strip_ansi(extra.decode("utf-8", errors="replace")))
+                        except OSError:
+                            pass
+                    break
+
+                result = handler(unseen, write_line)
+                if result == "ABORT":
+                    aborted = True
+                    break
+                if isinstance(result, int):
+                    unseen = unseen[result:]
+            else:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    rc = os.waitstatus_to_exitcode(status)
+                    break
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if rc is None and not detected_error and not aborted:
+            # Give a child that just closed its PTY a brief moment to exit cleanly.
+            for _ in range(30):
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    if wpid == pid:
+                        rc = os.waitstatus_to_exitcode(status)
+                        break
+                except ChildProcessError:
+                    rc = 0
+                    break
+                time.sleep(0.1)
+        if rc is None:
+            rc = _terminate_child(pid)
+
+    if (detected_error or aborted) and rc == 0:
+        rc = 1
+    return rc, scrub("".join(full_log), secrets)
+
+
+def parse_device_table(text: str) -> list[tuple[str, str]]:
+    """Parse `(S.No., Device name)` rows from IDrive's existing-devices table."""
+    rows: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        sno = m.group(1)
+        rest = m.group(2)
+        rest_no_os = re.sub(r"\s+(?:Linux|Windows|Mac|macOS|FreeBSD|Unix)\b.*$", "", rest, flags=re.I).strip()
+        dev_name = (rest_no_os or re.split(r"\s+", rest)[0]).strip()
+        if dev_name and dev_name.lower() != "device":
+            rows.append((sno, dev_name))
+    return rows
+
+
+def stop_idrive_daemons() -> None:
+    """Stop any stray IDrive background services spawned by interactive commands."""
+    for pat in ("/etc/idrivecron", "/opt/IDriveForLinux/"):
+        run_cmd(["pkill", "-TERM", "-f", pat], timeout=5)
+    time.sleep(1.0)
+    for pat in ("/etc/idrivecron", "/opt/IDriveForLinux/"):
+        run_cmd(["pkill", "-KILL", "-f", pat], timeout=5)
+
+
+def match_device_sno(rows: list[tuple[str, str]], target: str) -> str | None:
+    """Match target device name against parsed table rows, handling IDrive 24-char trimming."""
+    for sno, dev in rows:
+        if dev == target:
+            return sno
+    for sno, dev in rows:
+        if dev.lower() == target.lower():
+            return sno
+    if len(target) > 21:
+        for sno, dev in rows:
+            if dev.endswith("...") and target.startswith(dev[:-3]):
+                return sno
+    return None
+
+
+def rename_backup_location_if_needed(profile_dir: str, desired_name: str, secrets: list[str]) -> bool:
+    """Rename server backup location via DASHBOARD7 and sync CONFIGURATION_FILE."""
+    cfg_path = os.path.join(profile_dir, "CONFIGURATION_FILE")
+    cfg, was_plain = decrypt_json_file(cfg_path)
+    if not isinstance(cfg, dict):
+        print("[autologin] WARNING: Could not read CONFIGURATION_FILE to check backup location.", file=sys.stderr)
+        return False
+
+    cur_bl = str(cfg_get(cfg, "BACKUPLOCATION", "") or "")
+    if "#" not in cur_bl:
+        return True
+    prefix, current_nick = cur_bl.split("#", 1)
+    if current_nick == desired_name:
+        return True
+
+    res = run_cmd([IDRIVE_BIN, "--utilities", "DASHBOARD7", desired_name], timeout=60)
+    if res.returncode != 0 or "SUCCESS" not in (res.stdout + res.stderr):
+        err_detail = scrub((res.stdout + res.stderr).strip(), secrets)
+        print(f"[autologin] ERROR: DASHBOARD7 rename failed (rc={res.returncode}): {err_detail}", file=sys.stderr)
+        return False
+
+    new_bl = f"{prefix}#{desired_name}"
+    cfg_set(cfg, "BACKUPLOCATION", new_bl)
+    cur_rf = str(cfg_get(cfg, "RESTOREFROM", "") or "")
+    if cur_rf == cur_bl or not cur_rf:
+        cfg_set(cfg, "RESTOREFROM", new_bl)
+    encrypt_json_file_atomic(cfg_path, cfg, force_plaintext=was_plain)
+    print(f"[autologin] Renamed backup location to {desired_name!r}.")
+    return True
+
+
+
+
+def _base_auth_state() -> dict[str, Any]:
+    """Which shared prompts have been answered (each is answered once)."""
+    return {
+        "method": False,
+        "user": False,
+        "pwd": False,
+        "enter_key": False,
+        "confirm": 0,
+        "missing_key": False,
+        "totp_menu_count": 0,
+        "otp_attempts": 0,
+        "last_totp_counter": None,
+        "missing_totp": False,
+        "totp_failed": False,
+        "trust_answered": False,
+    }
+
+
+def handle_auth_prompts(tail: str, buf_len: int, state: dict[str, Any], write_fn, s: LoginSettings) -> int | str | None:
+    """Answer the prompts --login and --account-setting share: login method, username,
+    password, 2FA (authenticator code), "trust this device" (always yes), and the encryption
+    key. Returns how much output was consumed, "ABORT", or None if nothing matched."""
+    if re.search(rf"1\)\s*Login using IDrive credentials[\s\S]*?{MENU_PROMPT}", tail, re.I) and not state["method"]:
+        state["method"] = True
+        write_fn("1")
+        return buf_len
+    if re.search(r"Enter your IDrive username\s*:", tail, re.I) and not state["user"]:
+        state["user"] = True
+        write_fn(s.account)
+        return buf_len
+    if re.search(r"Enter your IDrive password\s*:", tail, re.I) and not state["pwd"]:
+        state["pwd"] = True
+        write_fn(s.password)
+        return buf_len
+    is_2fa_menu = bool(
+        re.search(rf"(?:Two-factor Authentication|Building menu for verification)[\s\S]*?{MENU_PROMPT}", tail, re.I)
+        or (re.search(r"^\s*1\)\s*Enter one-time code\b", tail, re.M | re.I) and re.search(MENU_PROMPT, tail, re.I))
+    )
+    if is_2fa_menu:
+        if s.totp_spec is None:
+            state["missing_totp"] = True
+            return "ABORT"
+        choice = None
+        for m in re.finditer(r"^\s*(\d+)\)\s*(.+)$", tail, re.M):
+            if re.search(r"one.?time\s*code|authenticator|totp|time.?based|\botp\b", m.group(2), re.I):
+                choice = m.group(1)
+                break
+        if choice is None or state["totp_menu_count"] >= 2:
+            state["totp_failed"] = True
+            return "ABORT"
+        state["totp_menu_count"] += 1
+        write_fn(choice)
+        return buf_len
+    if re.search(r"\bEnter\s+(?:the\s+)?(?:(?:one.?time|verification|security|OTP)\s+)?code\s*:", tail, re.I):
+        if s.totp_spec is None:
+            state["missing_totp"] = True
+            return "ABORT"
+        if state["otp_attempts"] >= 2:  # a second rejected code means the key or the clock is wrong
+            state["totp_failed"] = True
+            return "ABORT"
+        min_counter = (state["last_totp_counter"] + 1) if state["last_totp_counter"] is not None else None
+        code, counter = generate_totp(s.totp_spec, min_counter=min_counter)
+        s.secrets.append(code)
+        state["last_totp_counter"] = counter
+        state["otp_attempts"] += 1
+        write_fn(code)
+        return buf_len
+    if re.search(r"(?:do you want to trust|trust this (?:device|computer|machine))[\s\S]*?(?:Enter your choice|\(y/n\))", tail, re.I) and not state["trust_answered"]:
+        state["trust_answered"] = True
+        write_fn("y")
+        return buf_len
+    if re.search(r"Enter your encryption key\s*:", tail, re.I) and not state["enter_key"]:
+        if not s.enc_key:
+            state["missing_key"] = True
+            return "ABORT"
+        state["enter_key"] = True
+        write_fn(s.enc_key)
+        return buf_len
+    if re.search(r"do you want to login as.*\(y/n\)[\s\S]*?Enter your choice\s*:", tail, re.I) and state["confirm"] < 2:
+        state["confirm"] += 1
+        write_fn("y")
+        return buf_len
+    return None
+
+
+def _report_failure(state: dict[str, Any], rc: int, out: str, logged_in: int, cmd: str) -> None:
+    """Print why an automated login failed (the transcript is already scrubbed)."""
+    if state["missing_key"]:
+        msg = "IDRIVE_ENCRYPTION_KEY is required for this account's private encryption key"
+    elif state["missing_totp"]:
+        msg = f"two-factor authentication requested; set IDRIVE_TOTP_SECRET_FILE or run 'idrive {cmd}' interactively"
+    elif state["totp_failed"]:
+        msg = "two-factor code was rejected after retry; verify IDRIVE_TOTP_SECRET and the host clock"
+    else:
+        msg = f"idrive {cmd} failed (rc={rc}, logged_in={logged_in})"
+        print(out[-2500:], file=sys.stderr)
+    print(f"[autologin] ERROR: {msg}.", file=sys.stderr)
+
+
+def run_login_flow(s: LoginSettings) -> bool:
+    """Log an existing account back in with `idrive --login`."""
+    state = _base_auth_state()
+
+    def handle(buf: str, write_fn) -> int | str | None:
+        tail = buf[-1500:]
+        shared = handle_auth_prompts(tail, len(buf), state, write_fn, s)
+        if shared is not None:
+            return shared
+        if re.search(r"Do you really want to continue\s*\(y/n\)\?", tail, re.I):
+            write_fn("y")
+            return len(buf)
+        return None
+
+    rc, out = pty_interact(["--login"], handle, s.secrets, timeout_s=150)
+    _, logged_in = get_idriveuser_state()
+    if state["missing_key"] or state["missing_totp"] or state["totp_failed"] or rc != 0 or logged_in != 1:
+        _report_failure(state, rc, out, logged_in, "--login")
+        return False
+    return True
+
+
+def run_account_setting_flow(s: LoginSettings) -> bool:
+    """Set up an empty volume with `idrive --account-setting`.
+
+    Backup location: with IDRIVE_BACKUP_LOCATION set, an existing location of that name is
+    reused, otherwise a new one is created (and renamed to it afterwards, see
+    rename_backup_location_if_needed). Saved settings of a reused location are not copied.
+    """
+    state = _base_auth_state()
+    state.update({"enc_choice": False, "set_key": False, "conf_key": False, "checked_existing": False, "enter_loc": False, "proxy_seen": 0})
+
+    def handle(buf: str, write_fn) -> int | str | None:
+        tail = buf[-2500:]
+
+        if re.search(r"want to reconfigure.*\(y/n\)", tail, re.I):
+            write_fn("y")
+            return len(buf)
+        if re.search(r"Do you wish to use proxy\?", tail, re.I) and state["proxy_seen"] < 2:
+            state["proxy_seen"] += 1
+            write_fn("n")
+            return len(buf)
+
+        shared = handle_auth_prompts(tail, len(buf), state, write_fn, s)
+        if shared is not None:
+            return shared
+
+        if re.search(rf"1\)\s*Default encryption key[\s\S]*?{MENU_PROMPT}", tail, re.I) and not state["enc_choice"]:
+            state["enc_choice"] = True
+            write_fn("2" if s.enc_type == "PRIVATE" else "1")
+            return len(buf)
+        if re.search(r"Set your encryption key\s*:", tail, re.I) and not state["set_key"]:
+            state["set_key"] = True
+            write_fn(s.enc_key)
+            return len(buf)
+        if re.search(r"Confirm your encryption key\s*:", tail, re.I) and not state["conf_key"]:
+            state["conf_key"] = True
+            write_fn(s.enc_key)
+            return len(buf)
+
+        # IDrive found one location for this machine and asks whether to use another one.
+        m_single = re.search(rf"backup to device name is\s+(\S+)\..*Do you want to change[\s\S]*?{MENU_PROMPT}", tail, re.I)
+        if m_single:
+            write_fn("y" if s.backup_loc and m_single.group(1).strip('".') != s.backup_loc else "n")
+            return len(buf)
+        # Create a new location, or first look through the existing ones for the requested name.
+        if re.search(rf"1\)\s*Create new Backup Location[\s\S]*?{MENU_PROMPT}", tail, re.I):
+            if s.backup_loc and not state["checked_existing"]:
+                state["checked_existing"] = True
+                write_fn("2")
+            else:
+                write_fn("1")
+            return len(buf)
+        # The list of existing locations: pick the requested one, or go back and create it.
+        if re.search(r"Enter the\s+['\"]?S\.No\.?['\"]?\s+to select (?:the|your)\s+Backup\s+location[\s\S]*?Enter your choice\s*:", tail, re.I):
+            sno = match_device_sno(parse_device_table(buf[-3500:]), s.backup_loc) if s.backup_loc else None
+            write_fn(sno or "")
+            return len(buf)
+        if re.search(r"Enter your Backup Location", tail, re.I) and not state["enter_loc"]:
+            state["enter_loc"] = True
+            write_fn(s.backup_loc)
+            return len(buf)
+        # "Copy the saved settings of the selected location?" No.
+        if re.search(r"(?:Enter\s+'y'\s+to continue or\s+'n'\s+to skip|do you want to continue or skip)[\s\S]*?Enter your choice\s*:", tail, re.I):
+            write_fn("n")
+            return len(buf)
+        if re.search(rf"1\)\s*Mirror[\s\S]*?2\)\s*Relative[\s\S]*?{MENU_PROMPT}", tail, re.I):
+            write_fn("1")
+            return len(buf)
+        return None
+
+    rc, out = pty_interact(["--account-setting"], handle, s.secrets, timeout_s=180)
+    _, logged_in = get_idriveuser_state()
+    if state["missing_key"] or state["missing_totp"] or state["totp_failed"] or rc != 0 or logged_in != 1:
+        _report_failure(state, rc, out, logged_in, "--account-setting")
+        return False
+    return True
+
+
+def read_login_settings() -> LoginSettings | None:
+    """Read and check the login settings. None when no credentials are configured.
+    Raises ValueError for an invalid configuration."""
+    try:
+        account = read_env_or_file("IDRIVE_ACCOUNT").strip()
+        password = read_env_or_file("IDRIVE_PASSWORD")
+        enc_key = read_env_or_file("IDRIVE_ENCRYPTION_KEY")
+        totp_raw = read_env_or_file("IDRIVE_TOTP_SECRET").strip()
+    except FileNotFoundError as exc:
+        raise ValueError(str(exc)) from None
+    if not account and not password:
+        return None
+    if not account or not password:
+        raise ValueError("Both IDRIVE_ACCOUNT and IDRIVE_PASSWORD must be provided.")
+    enc_type = os.environ.get("IDRIVE_ENCRYPTION_TYPE", "DEFAULT").strip().upper() or "DEFAULT"
+    if enc_type not in ("DEFAULT", "PRIVATE"):
+        raise ValueError(f"Invalid IDRIVE_ENCRYPTION_TYPE={enc_type!r} (expected DEFAULT or PRIVATE).")
+    if enc_type == "PRIVATE" and not enc_key:
+        raise ValueError("IDRIVE_ENCRYPTION_KEY is required when IDRIVE_ENCRYPTION_TYPE=PRIVATE.")
+    backup_loc = os.environ.get("IDRIVE_BACKUP_LOCATION", "").strip()
+    if backup_loc and not BACKUP_LOCATION_RE.match(backup_loc):
+        raise ValueError("Invalid IDRIVE_BACKUP_LOCATION (must be 1-64 characters matching [A-Za-z0-9_-]).")
+    totp_spec = parse_totp_secret(totp_raw) if totp_raw else None
+    secrets = [password, account, enc_key, totp_raw, re.sub(r"[\s-]+", "", totp_raw)]
+    return LoginSettings(account, password, enc_type, enc_key, totp_spec, backup_loc, totp_raw, secrets)
+
+
+def cmd_autologin() -> int:
+    """Run by start.sh after prepare. Does nothing without credentials or when already logged in;
+    logs a logged-out account back in; sets up an empty volume. Exit 1 on failure (start.sh
+    still starts IDrive, and the health check reports the problem)."""
+    try:
+        s = read_login_settings()
+    except ValueError as exc:
+        print(f"[autologin] ERROR: {exc}", file=sys.stderr)
+        return 1
+    if s is None:
+        print("[autologin] Credentials not provided; skipping automated login.")
+        return 0
+
+    user_id, logged_in = get_idriveuser_state()
+    pdir = resolve_profile_dir(user_id)
+    cfg_path = os.path.join(pdir, "CONFIGURATION_FILE") if pdir else ""
+
+    if pdir and os.path.isfile(cfg_path):
+        cfg, _ = decrypt_json_file(cfg_path)
+        if not isinstance(cfg, dict):
+            print("[autologin] ERROR: Could not read CONFIGURATION_FILE; skipping automated login for now.", file=sys.stderr)
+            return 1
+        # Never log a volume set up for one account into another.
+        existing_ids = {
+            val.lower()
+            for raw in (user_id, os.path.basename(pdir), cfg_get(cfg, "USERNAME", ""), cfg_get(cfg, "EMAILADDRESS", ""))
+            if (val := str(raw or "").strip())
+        }
+        if s.account.lower() not in existing_ids:
+            print(
+                "[autologin] ERROR: Volume already contains a configured profile for another account; "
+                "refusing to overwrite existing backup metadata.",
+                file=sys.stderr,
+            )
+            return 1
+        if str(cfg_get(cfg, "ENCRYPTIONTYPE", "DEFAULT")).upper() == "PRIVATE" and not s.enc_key:
+            print("[autologin] ERROR: Existing profile uses PRIVATE encryption; IDRIVE_ENCRYPTION_KEY is required.", file=sys.stderr)
+            return 1
+        cron_data, _ = decrypt_json_file(CRONTAB_FILE)
+        inactive = (get_cron_status(cron_data, user_id) or "").upper() == "INACTIVE"
+        if logged_in == 1 and not inactive:
+            print("[autologin] Account already logged in and active; skipping automated login.")
+            return 0
+        if logged_in == 1:  # logged in, but IDrive switched the schedule off: log in again
+            run_cmd([IDRIVE_BIN, "--logout", "1", "0"], timeout=30)
+        print("[autologin] Restoring session via idrive --login...")
+        ok = run_login_flow(s)
+        stop_idrive_daemons()  # the login may start IDrive services; start.sh starts them itself
+        if not ok:
+            return 1
+        print("[autologin] Session restored successfully.")
+        return cmd_prepare(quiet=True)
+
+    print("[autologin] Configuring unconfigured volume via idrive --account-setting...")
+    ok = run_account_setting_flow(s)
+    stop_idrive_daemons()
+    if not ok:
+        return 1
+    new_user_id, _ = get_idriveuser_state()
+    new_pdir = resolve_profile_dir(new_user_id)
+    rename_ok = True
+    if new_pdir and s.backup_loc:
+        rename_ok = rename_backup_location_if_needed(new_pdir, s.backup_loc, s.secrets)
+    prep_rc = cmd_prepare(quiet=True)
+    if not rename_ok:
+        return 1
+    print("[autologin] Account setup completed successfully.")
+    return prep_rc
+
+
 def main() -> int:
-    commands = {"prepare": cmd_prepare, "healthcheck": cmd_healthcheck}
+    # Keep stdout and stderr lines in order in `docker logs` (stdout is block-buffered when piped).
+    sys.stdout.reconfigure(line_buffering=True)
+    commands = {"prepare": cmd_prepare, "autologin": cmd_autologin, "healthcheck": cmd_healthcheck}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(f"Usage: idrive-init.py {{{'|'.join(commands)}}}", file=sys.stderr)
         return 2

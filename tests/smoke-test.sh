@@ -208,4 +208,55 @@ echo "[7] A hung IDrive makes the health check fail after ${took}s with nothing 
 
 docker stop -t 10 "$c" >/dev/null
 
+# 8. Automated-login building blocks, without contacting IDrive: 2FA codes match RFC 6238's
+#    test vector, log scrubbing redacts whole words only, and bad settings fail fast.
+docker run --rm --entrypoint python3 "$IMAGE" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("m", "/usr/local/bin/idrive-init.py")
+m = importlib.util.module_from_spec(spec); sys.modules["m"] = m; spec.loader.exec_module(m)
+key = m.parse_totp_secret("GEZD GN BVGY 3TQO JQGE ZDGN BVGY 3TQO JQ")   # RFC 6238 SHA-1 seed
+assert m.generate_totp(key, now=59) == ("287082", 1)
+uri = m.parse_totp_secret("otpauth://totp/IDrive:u@example.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=6&period=30")
+assert m.generate_totp(uri, now=59) == ("287082", 1)
+for bad in ("not!valid!base32", "otpauth://hotp/x?secret=GEZDGNBV"):
+    try:
+        m.parse_totp_secret(bad); raise AssertionError(bad)
+    except ValueError:
+        pass
+assert m.scrub("user bob@example.com bobcat bob", ["bob@example.com"]) == "user <REDACTED> bobcat <REDACTED>"
+' || fail "TOTP / scrub unit checks"
+for args in "IDRIVE_ACCOUNT=u IDRIVE_PASSWORD=p IDRIVE_BACKUP_LOCATION=bad#name" \
+            "IDRIVE_ACCOUNT=u IDRIVE_PASSWORD=p IDRIVE_TOTP_SECRET=not!valid" \
+            "IDRIVE_ACCOUNT=u" \
+            "IDRIVE_ACCOUNT=u IDRIVE_PASSWORD=p IDRIVE_ENCRYPTION_TYPE=PRIVATE" \
+            "IDRIVE_ACCOUNT_FILE=/missing IDRIVE_PASSWORD=p"; do
+    # shellcheck disable=SC2086  # $args is a list of VAR=value words
+    if docker run --rm --entrypoint env "$IMAGE" $args timeout 20 idrive-init.py autologin >/dev/null 2>&1; then
+        fail "autologin accepted invalid settings: $args"
+    fi
+done
+echo "[8] 2FA codes, log scrubbing and settings validation"
+
+# 9. Credentials never reach IDrive's processes, and with credentials (even partial) configured,
+#    an account that is not set up counts as unhealthy.
+vol="${RUN_ID}-env"
+c="${RUN_ID}-env"
+docker volume create "$vol" >/dev/null
+VOLUMES+=("$vol")
+CONTAINERS+=("$c")
+docker run -d --name "$c" -e IDRIVE_PASSWORD=secret-pw -e IDRIVE_ENCRYPTION_KEY=secret-key \
+    -e IDRIVE_TOTP_SECRET=JBSWY3DPEHPK3PXP -v "$vol:/opt/IDriveForLinux/idriveIt" "$IMAGE" >/dev/null
+wait_file "$c" /opt/IDriveForLinux/idriveIt/cache/version || fail "cache/version missing"
+sleep 3
+docker exec "$c" bash -c '
+set -euo pipefail
+pid=$(pgrep -f /etc/idrivecron | head -n 1)
+! tr "\0" "\n" < "/proc/$pid/environ" | grep -qE "^IDRIVE_(PASSWORD|ENCRYPTION_KEY|TOTP_SECRET)="
+! idrive-init.py healthcheck 2>/dev/null
+! IDRIVE_ACCOUNT_FILE=/run/secrets/x idrive-init.py healthcheck 2>/dev/null
+env -u IDRIVE_PASSWORD idrive-init.py healthcheck
+' || fail "credential scrubbing or credentials-configured health rule"
+docker stop -t 10 "$c" >/dev/null
+echo "[9] Credentials kept out of IDrive's processes; unconfigured + credentials = unhealthy"
+
 echo "PASS: smoke test for $IMAGE"

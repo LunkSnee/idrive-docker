@@ -8,6 +8,7 @@ compose.override.yaml
 .env
 .env.*
 !.env.example
+secrets/
 
 # Local iDrive config or backup data pulled out of a container
 idriveIt/

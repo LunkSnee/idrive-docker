@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Container entry point (PID 1): prepares the config volume, starts IDrive's own scheduler
-# (/etc/idrivecron, which runs the backup jobs), and streams IDrive's logs to `docker logs`.
+# Container entry point (PID 1): prepares the config volume, optionally logs in, starts
+# IDrive's own scheduler (/etc/idrivecron, which runs the backup jobs), and streams IDrive's
+# logs to `docker logs`.
 # `docker stop` stops IDrive cleanly and exits 0.
 set -euo pipefail
 
@@ -13,6 +14,15 @@ echo "Initializing IDrive container..."
 if ! /usr/local/bin/idrive-init.py prepare; then
     echo "WARNING: preparing the config volume failed; starting IDrive anyway." >&2
 fi
+
+# 1b. Optional automated login: with credentials configured (IDRIVE_ACCOUNT_FILE etc.), set up
+#     an empty volume or log a logged-out account back in. A failure is logged and IDrive
+#     starts anyway; the health check then reports it.
+if ! /usr/local/bin/idrive-init.py autologin; then
+    echo "WARNING: Automated login failed; starting IDrive anyway (see the messages above)." >&2
+fi
+# Keep plain-text credentials out of the environment of IDrive's processes (/proc/*/environ).
+unset IDRIVE_ACCOUNT IDRIVE_PASSWORD IDRIVE_ENCRYPTION_KEY IDRIVE_TOTP_SECRET
 
 # 2. Process Management & Signal Trapping
 exit_handler() {

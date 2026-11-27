@@ -83,6 +83,47 @@ Now you login and specify the basic settings. For me this worked best:
 For more information and additional `idrive` parameters have a look at the [IDrive documentation](https://www.idrive.com/readme).
 The login and settings are stored persistent in the volume or the bind mounts.
 
+## Automated login (optional)
+Instead of logging in by hand, the container can set up an empty config volume and log back
+in by itself whenever it starts logged out. It reads the credentials from Docker secret files.
+
+1. Create a `secrets` folder next to `compose.yaml` (it is gitignored), one value per file,
+   **no trailing newline**:
+   ```shell
+   mkdir -p secrets && chmod 700 secrets
+   printf '%s' 'you@example.com'      > secrets/idrive_account
+   printf '%s' 'your-idrive-password' > secrets/idrive_password
+   printf '%s' 'YOURTOTPSETUPKEY'     > secrets/idrive_totp_secret     # only if 2FA is on
+   # printf '%s' 'your-private-key'   > secrets/idrive_encryption_key  # only for a private key
+   chmod 400 secrets/idrive_*
+   ```
+2. In `compose.yaml`, uncomment the matching lines in both `secrets:` blocks.
+3. Copy `.env.example` to `.env` and uncomment the matching `IDRIVE_..._FILE` lines.
+4. `docker compose up -d` and watch `docker logs -f idrive` for
+   `[autologin] Account setup completed successfully.`
+
+| Variable | What it does |
+|----------|--------------|
+| `IDRIVE_ACCOUNT_FILE` / `IDRIVE_ACCOUNT` | IDrive login (email or username). Turns on automated login. |
+| `IDRIVE_PASSWORD_FILE` / `IDRIVE_PASSWORD` | Password for that account. |
+| `IDRIVE_TOTP_SECRET_FILE` / `IDRIVE_TOTP_SECRET` | Authenticator-app setup key (or `otpauth://` link), only if 2FA is on. |
+| `IDRIVE_ENCRYPTION_KEY_FILE` / `IDRIVE_ENCRYPTION_KEY` | Your private encryption key, only if the account uses one. |
+| `IDRIVE_ENCRYPTION_TYPE` | First setup only: `DEFAULT` (default) or `PRIVATE`. |
+| `IDRIVE_BACKUP_LOCATION` | First setup only: name of this device in your IDrive account (1-64 letters, digits, `-`, `_`). An existing location with that name is reused, otherwise it is created. Without it, IDrive names the device after the container's hostname. |
+
+The `_FILE` form is recommended: plain values can be read by anyone who can run `docker inspect`.
+Either way, the container removes the plain values before IDrive's processes start. A volume
+that is set up for one account is never logged into another.
+
+**Two-factor authentication:** the container can only answer 2FA with an **authenticator-app**
+setup key, the text key shown when you add an authenticator app to your IDrive account (often
+offered instead of scanning the QR code). Keeping it next to the password means anyone with root
+on the Docker host has both factors. Without a key, log in by hand with
+`docker exec -it idrive idrive --login`.
+
+With credentials configured, `(healthy)` also requires the account to be set up, so a failed
+first setup shows as unhealthy instead of "waiting for setup".
+
 ## Backup configuration
 The configuration and operation of backup and restore can be done in the IDrive GUI. Help can be found on the [IDrive FAQs](https://www.idrive.com/faq_linux#linuxWeb2) for Linux.
 
@@ -135,6 +176,11 @@ with the offline smoke test before anything is published. Run it against a local
 docker build -t idrive-docker:local .
 ./tests/smoke-test.sh idrive-docker:local
 ```
+`tests/e2e-upgrade-test.sh <image> [<next image>...]` is a live test against IDrive's servers:
+automated first setup (with 2FA when a key is given), real backups, then the same volume on each
+following image. It reads plain `IDRIVE_ACCOUNT`, `IDRIVE_PASSWORD` and optionally
+`IDRIVE_TOTP_SECRET` from `.env` (or `$ENV_FILE`). **Use a separate test account:** each run
+creates an `E2E-Test-...` backup location there and uploads a few small files.
 
 The `Lint` workflow checks every change. Run the same checks locally (only Docker needed):
 ```shell
