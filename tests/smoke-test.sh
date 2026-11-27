@@ -39,7 +39,20 @@ ver=$(docker run --rm --entrypoint /opt/IDriveForLinux/bin/idrive "$IMAGE" --ver
 [ -n "$ver" ] || fail "idrive --version printed nothing"
 echo "[1] idrive --version = $ver"
 
-# 2. A fresh, empty volume starts: IDrive's service runs, the volume is populated,
+# 2. The image is the lean build: UTF-8 locale without the locales package, no system
+#    cron/systemd, and IDrive's Cloud Drive left out (unless EXPECT_CLOUD_DRIVE=true).
+docker run --rm -e EXPECT_CLOUD_DRIVE="${EXPECT_CLOUD_DRIVE:-false}" --entrypoint bash "$IMAGE" -c '
+set -euo pipefail
+[ "$LANG" = C.UTF-8 ] && [ "$LC_ALL" = C.UTF-8 ]
+for pkg in cron systemd locales unzip; do ! dpkg -s "$pkg" >/dev/null 2>&1; done
+command -v curl >/dev/null && command -v tar >/dev/null && command -v ifconfig >/dev/null
+cd=/opt/IDriveForLinux/bin/Idrivelib/dependencies/cloud-drive
+if [ "$EXPECT_CLOUD_DRIVE" = true ]; then [ -d "$cd" ]; else [ ! -e "$cd" ]; fi
+[ -z "$(ls -A /opt/IDriveForLinux/idriveIt)" ]
+' || fail "lean image checks"
+echo "[2] Lean image: C.UTF-8, no cron/systemd/locales, Cloud Drive as expected"
+
+# 3. A fresh, empty volume starts: IDrive's service runs, the volume is populated,
 #    the time zone applies and the image's health check passes.
 vol="${RUN_ID}-fresh"
 c="${RUN_ID}-fresh"
@@ -56,12 +69,12 @@ pgrep -f /etc/idrivecron >/dev/null
 [ "$(cat /opt/IDriveForLinux/idriveIt/cache/version)" = "$EXPECT_VER" ]
 [ "$(date +%Z)" = EST ] || [ "$(date +%Z)" = EDT ]
 ' || fail "fresh start checks"
-echo "[2] Fresh volume: service running, volume populated, TZ applied"
+echo "[3] Fresh volume: service running, volume populated, TZ applied"
 
-# 3. docker stop is a clean stop.
+# 4. docker stop is a clean stop.
 docker stop -t 10 "$c" >/dev/null
 rc=$(docker inspect --format '{{.State.ExitCode}}' "$c")
 [ "$rc" = 0 ] || fail "expected exit code 0 after docker stop, got $rc"
-echo "[3] docker stop exits 0"
+echo "[4] docker stop exits 0"
 
 echo "PASS: smoke test for $IMAGE"

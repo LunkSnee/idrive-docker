@@ -1,110 +1,138 @@
-# Specify the exact, minimal base image
-FROM debian:trixie-slim
+# IDrive for Linux in a container.
+#
+# Two stages keep the published image small:
+#   builder - downloads IDrive's installer, runs it, checks that the installed programs start,
+#             and packs the default contents of the config folder into idriveIt.orig.tar.gz
+#   runtime - a clean debian:trixie-slim with only what IDrive needs at run time, plus the
+#             installed /opt/IDriveForLinux copied from the builder
+#
+# docker/start.sh (the container's entry point) restores missing files from
+# idriveIt.orig.tar.gz into the persistent config volume at every start.
 
-# OCI image labels are applied by the build workflow, not here, so they derive from
-# whichever repository builds the image and stay correct in a fork.
+# ---------------------------------------------------------------------------------------------
+# Stage 1: run IDrive's installer
+# ---------------------------------------------------------------------------------------------
+FROM debian:trixie-slim AS builder
 
-# URL of the iDrive script package, with a fallback if the version-check couldn't resolve one.
-ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/linux-bin/idriveforlinux.bin
-
-# Supplied automatically by buildx (e.g. linux/amd64, linux/arm64). Used below to add
-# the 32-bit runtime that iDrive's ARM helper binaries need.
 ARG TARGETPLATFORM
-
-# Build-time only: keeps apt quiet during the build without changing apt's behaviour
-# for anyone running it inside the finished container.
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Consolidate all environment variables into a single layer.
-# PYTHONDONTWRITEBYTECODE prevents Python from generating .pyc files on disk at runtime.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    LC_ALL=en_US.UTF-8 \
-    LANG=en_US.UTF-8 \
-    LANGUAGE=en_US:en \
+    LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8 \
+    LANGUAGE=C.UTF-8 \
     LD_LIBRARY_PATH="/opt/IDriveForLinux/bin/Idrivelib/dependencies/python/lib" \
-    PATH="${PATH}:/opt/IDriveForLinux/bin" \
-    EDITOR=nano \
-    TERM=xterm
+    PATH="${PATH}:/opt/IDriveForLinux/bin"
 
-# Consolidate dependencies, installation, and cleanup into a single atomic layer.
-# The installer is the last command in its pipe, so its exit status already fails the build.
-# hadolint ignore=DL4006
+# What the installer and the build checks need:
+# - libpopt0 must exist before the installer runs, or it deploys an older transfer helper
+#   (idevsutil) that does not understand --cmd and fails every backup.
+# - libexpat1 is needed by IDrive's bundled Python (checked below via `dashboard -v`).
+# - The installer refuses to run without `crontab`. IDrive brings its own scheduler
+#   (/etc/idrivecron), so a stub satisfies the check without installing cron and systemd.
+# - arm64 hosts run IDrive's 32-bit ARM build, which needs the armhf C library.
 RUN apt-get update && \
-    # 1. Install specific required packages; omitting vim and non-essentials.
-    #
-    #    libpopt0 must be installed BEFORE the iDrive installer runs below. The
-    #    installer carries more than one build of its EVS helper and chooses by
-    #    probing for libpopt: with the library present it deploys the current helper,
-    #    which links libpopt.so.0 and understands the --cmd option the client passes.
-    #    Without it, it falls back to an older helper that rejects --cmd, and every
-    #    backup fails with "idevs: --cmd=...: unknown option".
-    #
-    #    Confirmed by comparing built images: the helper self-reports
-    #    [20/JAN/2026] when built without libpopt0 and [17/AUG/2026] with it.
-    #    Installing the package into an already-built image does not help -- the
-    #    fallback binary is baked in at install time.
     apt-get install -y --no-install-recommends \
-        ca-certificates locales python3 tzdata \
-        cron curl unzip net-tools nano procps \
-        libpopt0 && \
-    # 1b. On arm64, iDrive ships those helpers as 32-bit armhf executables rather than
-    #     arm64, hardcoded to the interpreter path /lib/ld-linux.so.3. Enable the
-    #     foreign architecture, install the 32-bit runtime, and provide that path
-    #     (Debian ships it as /lib/ld-linux-armhf.so.3).
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        ca-certificates curl procps libpopt0 libexpat1 && \
+    if [ "${TARGETPLATFORM:-}" = "linux/arm64" ] || { [ -z "${TARGETPLATFORM:-}" ] && [ "$(uname -m)" = "aarch64" ]; }; then \
         dpkg --add-architecture armhf && \
         apt-get update && \
         apt-get install -y --no-install-recommends libc6:armhf libpopt0:armhf && \
         ln -sf /lib/ld-linux-armhf.so.3 /lib/ld-linux.so.3; \
     fi && \
-    # 2. Configure standard UTF-8 locales directly.
-    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
-    locale-gen && \
-    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
-    # 3. Pre-create the required directory structure for IDrive.
+    rm -rf /var/lib/apt/lists/* && \
+    printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/crontab && \
+    chmod +x /usr/local/bin/crontab
+
+# CI passes the current release's (cache-busted) URL; the default always points at the latest.
+ARG IDRIVE_URL=https://www.idrivedownloads.com/downloads/linux/linux-bin/idriveforlinux.bin
+# IDrive's optional Cloud Drive component (~60 MB) is not needed for backups.
+ARG INCLUDE_CLOUD_DRIVE=false
+
+# Install, trim, pack the config defaults, then check that the installed programs start.
+# printf, not `echo -en`: RUN uses dash, whose echo prints -en literally. The installer is the
+# last command in its pipe, so its exit status already fails the build.
+# hadolint ignore=DL4006
+RUN case "$INCLUDE_CLOUD_DRIVE" in true|false) ;; \
+        *) echo "INCLUDE_CLOUD_DRIVE must be true or false" >&2; exit 1 ;; esac && \
     mkdir -p /opt/IDriveForLinux/idriveIt/cache /opt/IDriveForLinux/bin \
              /opt/IDriveForLinux/idriveIt/user_profile/root/.trace && \
-    # 4. Create spoofed installation state files and system symlinks.
     touch /opt/IDriveForLinux/idriveIt/inst.track \
           /opt/IDriveForLinux/idriveIt/idrivecrontab.json \
           /opt/IDriveForLinux/idriveIt/user_profile/root/.trace/traceLog.txt && \
     ln -s /opt/IDriveForLinux/idriveIt/idrivecrontab.json /etc/idrivecrontab.json && \
     ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron && \
-    # 5. Download the installer directly to /tmp.
     curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
         -o /tmp/idriveforlinux.bin "${IDRIVE_URL}" && \
     chmod a+x /tmp/idriveforlinux.bin && \
-    # 6. Execute the installer non-interactively using the required character sequence.
-    #    printf, not `echo -en`: RUN uses /bin/sh (dash on Debian), whose echo does
-    #    not recognise -en and emits it as literal text, feeding the installer
-    #    "-en A" plus a stray newline instead of "A".
     printf 'A\n\n\n\n' | /tmp/idriveforlinux.bin --install && \
-    # 7. Purge temporary build tools and execute deep artifact cleansing.
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* \
-           /tmp/* \
-           /var/tmp/* \
-           /opt/IDriveForLinux/bin/Idrivelib/dependencies/pkg/* && \
+    rm -rf /tmp/* /var/tmp/* /opt/IDriveForLinux/bin/Idrivelib/dependencies/pkg/* && \
     find /opt/IDriveForLinux/bin/Idrivelib/cronsetup/ -mindepth 1 -maxdepth 1 ! -name 'debian' -exec rm -rf {} + && \
-    # 8. Archive the pristine configuration for dynamic volume initialization on startup.
-    #    Kept outside /tmp: /tmp is routinely overridden (--tmpfs /tmp, a compose
-    #    tmpfs), which would silently remove the archive start.sh needs to keep the
-    #    idevsutil helpers in step with the image. Sibling of the volume, not inside it.
+    if [ "$INCLUDE_CLOUD_DRIVE" = false ]; then \
+        rm -rf /opt/IDriveForLinux/bin/Idrivelib/dependencies/cloud-drive \
+               /opt/IDriveForLinux/.config/cloud-drive; \
+    fi && \
     echo "" > /opt/IDriveForLinux/idriveIt/user_profile/root/.trace/traceLog.txt && \
-    tar -czf /opt/IDriveForLinux/idriveIt.orig.tar.gz -C /opt/IDriveForLinux idriveIt
+    tar -czf /opt/IDriveForLinux/idriveIt.orig.tar.gz -C /opt/IDriveForLinux idriveIt && \
+    /opt/IDriveForLinux/bin/idrive --version >/dev/null && \
+    for bin in /opt/IDriveForLinux/idriveIt/idevsutil*; do "$bin" --help >/dev/null; done && \
+    if [ -x /opt/IDriveForLinux/bin/Idrivelib/dependencies/python/dashboard ]; then \
+        /opt/IDriveForLinux/bin/Idrivelib/dependencies/python/dashboard -v >/dev/null; \
+    fi && \
+    # The defaults live in the archive; leaving them in the image as well would duplicate
+    # the idevsutil programs (start.sh restores them into the volume).
+    rm -rf /opt/IDriveForLinux/idriveIt/*
 
-# Set the working directory for subsequent commands and container execution.
+# ---------------------------------------------------------------------------------------------
+# Stage 2: runtime image
+# ---------------------------------------------------------------------------------------------
+FROM debian:trixie-slim AS runtime
+
+ARG TARGETPLATFORM
+ARG DEBIAN_FRONTEND=noninteractive
+
+# C.UTF-8 is built into Debian, so no locales package is needed for UTF-8 file names.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8 \
+    LANGUAGE=C.UTF-8 \
+    LD_LIBRARY_PATH="/opt/IDriveForLinux/bin/Idrivelib/dependencies/python/lib" \
+    PATH="${PATH}:/opt/IDriveForLinux/bin" \
+    EDITOR=nano \
+    TERM=xterm
+
+# Run-time packages:
+# - curl: IDrive checks for `curl` and `tar` before every backup and schedule change.
+# - net-tools: IDrive builds its device ID from the MAC address reported by `ifconfig -a`.
+# - procps: `pgrep`/`pkill`, used by start.sh and the health check.
+# - tzdata: so TZ works. nano: the editor IDrive opens for exclude lists. python3: kept from the
+#   single-stage image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl python3 tzdata \
+        net-tools nano procps libpopt0 libexpat1 && \
+    if [ "${TARGETPLATFORM:-}" = "linux/arm64" ] || { [ -z "${TARGETPLATFORM:-}" ] && [ "$(uname -m)" = "aarch64" ]; }; then \
+        dpkg --add-architecture armhf && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends libc6:armhf libpopt0:armhf && \
+        ln -sf /lib/ld-linux-armhf.so.3 /lib/ld-linux.so.3; \
+    fi && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -s /opt/IDriveForLinux/idriveIt/idrivecrontab.json /etc/idrivecrontab.json && \
+    ln -s /opt/IDriveForLinux/bin/idrive /etc/idrivecron
+
+COPY --from=builder /opt/IDriveForLinux /opt/IDriveForLinux
+
 WORKDIR /opt/IDriveForLinux/bin
 
-# Copy the initialization script and set executable permissions natively via Docker.
 COPY --chmod=755 docker/start.sh /start.sh
 
-# Declare the persistent volume mount point.
+# IDrive's settings, saved login and logs. Mount a volume or host folder here.
 VOLUME ["/opt/IDriveForLinux/idriveIt"]
 
 # Define container health check to monitor the core backup daemon
 HEALTHCHECK --interval=2m --timeout=10s --start-period=30s --retries=3 \
     CMD pgrep -f "/etc/idrivecron" > /dev/null || exit 1
 
-# Define the default execution command.
 CMD ["/start.sh"]

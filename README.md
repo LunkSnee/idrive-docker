@@ -13,6 +13,12 @@ Build from the repository root:
 ```shell
 docker build -t idrive-docker:latest .
 ```
+The image leaves out IDrive's optional Cloud Drive component (~60 MB), which backups do not
+need. To keep it: `docker build --build-arg INCLUDE_CLOUD_DRIVE=true -t idrive-docker:latest .`
+
+Docker caches the downloaded installer, and the default download link never changes, so a
+plain rebuild keeps the IDrive version it downloaded first. Add `--no-cache` to pick up a
+new IDrive release.
 Image is tagged `idrive-docker:latest`. The image is available on GHCR. Thx to @araines, the image gets also tagged with the iDrive client version.
 - `ghcr.io/lunksnee/idrive-docker:latest`
 - `ghcr.io/lunksnee/idrive-docker:<version>`, e.g. `:3.17.1`
