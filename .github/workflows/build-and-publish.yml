@@ -4,7 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "idrive/build/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "docker/**"
+      - "scripts/**"
   schedule:
     - cron: "12 9 * * *"
   workflow_dispatch:
@@ -55,7 +58,7 @@ jobs:
 
       - name: Get iDrive version
         id: version
-        run: ./idrive/version.sh
+        run: ./scripts/version.sh
 
       - name: Check DockerHub Secrets
         id: check-secrets
@@ -153,7 +156,7 @@ jobs:
         run: |
           build=false
           if   [ -n "$REQUESTED" ];            then reason="rollback request; nothing to build"
-          elif [ "$EVENT" = "push" ];          then build=true; reason="push to idrive/build"
+          elif [ "$EVENT" = "push" ];          then build=true; reason="push to main"
           elif [ "$EVENT" = "workflow_dispatch" ]; then build=true; reason="manual dispatch"
           elif [ "$IMAGE_EXISTS" = "false" ];  then build=true; reason="image does not exist yet"
           elif [ "$BASE_STALE" = "true" ];     then build=true; reason="base image updated"
@@ -168,7 +171,7 @@ jobs:
         if: steps.decide.outputs.build == 'true'
         uses: docker/build-push-action@v7
         with:
-          context: idrive/build
+          context: .
           tags: ${{ steps.generate-tags.outputs.tags }}
           # Passed as a buildkit input (not evaluated by a runner shell). version.sh
           # exits non-zero if the URL is unresolved, so we never reach here empty.

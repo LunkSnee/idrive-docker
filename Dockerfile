@@ -95,7 +95,7 @@ RUN apt-get update && \
 WORKDIR /opt/IDriveForLinux/bin
 
 # Copy the initialization script and set executable permissions natively via Docker.
-COPY --chmod=755 start.sh /start.sh
+COPY --chmod=755 docker/start.sh /start.sh
 
 # Declare the persistent volume mount point.
 VOLUME ["/opt/IDriveForLinux/idriveIt"]

@@ -21,9 +21,9 @@ updates:
     commit-message:
       prefix: "ci"
 
-  # Base image in idrive/build/Dockerfile
+  # Base image in Dockerfile
   - package-ecosystem: "docker"
-    directory: "/idrive/build"
+    directory: "/"
     schedule:
       interval: "weekly"
     cooldown:

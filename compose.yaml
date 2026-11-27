@@ -1,10 +1,12 @@
 services:
   idrive:
-    build: ./idrive/build/
+    build: .
     image: ghcr.io/lunksnee/idrive-docker:latest
     container_name: idrive
     volumes:
       - idrive:/opt/IDriveForLinux/idriveIt
+      # Or a host folder instead of the named volume:
+      # - /path/to/config:/opt/IDriveForLinux/idriveIt
       - /path/to/backup:/source/1:ro
     restart: unless-stopped
     environment:

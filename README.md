@@ -9,9 +9,9 @@ GitHub: https://github.com/LunkSnee/idrive-docker
 - IDrive account
 
 ## Build image
-The Dockerfile lives in `idrive/build/`, so build from that directory:
+Build from the repository root:
 ```shell
-docker build -t idrive-docker:latest idrive/build/
+docker build -t idrive-docker:latest .
 ```
 Image is tagged `idrive-docker:latest`. The image is available on GHCR. Thx to @araines, the image gets also tagged with the iDrive client version.
 - `ghcr.io/lunksnee/idrive-docker:latest`
@@ -46,17 +46,13 @@ docker run -d --name idrive \
            ghcr.io/lunksnee/idrive-docker:latest
 ```
 
-## Build (optional)  & Run with docker-compose - [docker-compose.yml](/LunkSnee/idrive-docker/blob/main/docker-compose.yml)
+## Build (optional)  & Run with docker-compose - [compose.yaml](compose.yaml)
 ```shell
 docker compose build idrive
 docker compose up -d
 ```
-To use bind mounts for the config instead of a named volume, use
-[docker-compose-mounts.yml](/LunkSnee/idrive-docker/blob/main/docker-compose-mounts.yml)
-and adjust the `/path/to/config` mapping:
-```shell
-docker compose -f docker-compose-mounts.yml up -d
-```
+To use a bind mount for the config instead of the named volume, swap the two
+`/opt/IDriveForLinux/idriveIt` lines in `compose.yaml` and adjust the `/path/to/config` mapping.
 
 ## Tasks after first start
 You have to login to your IDrive account after first start.
