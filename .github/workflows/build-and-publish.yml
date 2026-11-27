@@ -1,5 +1,12 @@
 name: Build and Publish
 
+# Builds the image and publishes it to GHCR (and Docker Hub when its secrets are set).
+#   decide:  resolve the current IDrive release and decide whether anything needs building
+#            (new IDrive version, new Debian base image, a change in this repo, or a manual run)
+#   verify:  build each architecture on a native runner and run tests/smoke-test.sh against it
+#   build-and-push-docker-image: publish the version tag (main only, after verify passed) and
+#            move :latest once the release is old enough (LATEST_MIN_AGE_DAYS)
+
 on:
   push:
     branches: [main]
@@ -8,6 +15,18 @@ on:
       - ".dockerignore"
       - "docker/**"
       - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/build-and-publish.yml"
+  # Every pull request that touches the image is built and tested, never pushed
+  # (no branch filter, so stacked PRs are tested too).
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "docker/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/build-and-publish.yml"
   schedule:
     - cron: "12 9 * * *"
   workflow_dispatch:
@@ -36,13 +55,22 @@ env:
   BLOCKED_VERSIONS: ""
 
 jobs:
-  build-and-push-docker-image:
-    name: Build Docker image and push to repositories
+  decide:
+    name: Resolve iDrive version and decide whether to build
     runs-on: ubuntu-latest
-    
     permissions:
       contents: read
-      packages: write
+      packages: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      reason: ${{ steps.decide.outputs.reason }}
+      idrive_version: ${{ steps.version.outputs.idrive_version }}
+      idrive_URL: ${{ steps.version.outputs.idrive_URL }}
+      idrive_release_date: ${{ steps.version.outputs.idrive_release_date }}
+      idrive_age_days: ${{ steps.version.outputs.idrive_age_days }}
+      image_exists: ${{ steps.check-image.outputs.exists }}
+      base_stale: ${{ steps.check-base.outputs.needs-updating }}
+      version_tag: ${{ steps.check-version.outputs.tag }}
 
     steps:
       - name: Checkout code
@@ -59,6 +87,141 @@ jobs:
       - name: Get iDrive version
         id: version
         run: ./scripts/version.sh
+
+      - name: Login to Github Packages (GHCR)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- NEW: Check if the image currently exists in the registry ---
+      - name: Check if image exists in GHCR
+        id: check-image
+        if: github.event_name != 'push' && github.event_name != 'pull_request'
+        run: |
+          # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
+          if docker manifest inspect "$IMAGE_REF" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- UPDATED: Only run update checkers if the image already exists ---
+      - name: Check for new iDrive version
+        if: github.event_name != 'push' && github.event_name != 'pull_request' && steps.check-image.outputs.exists == 'true'
+        id: check-version
+        uses: tyriis/docker-image-tag-exists@e73c8fdfab85076cdcf2ce4b443181fae2153675 # v2026.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          repository: ${{ env.IMAGE_LOWERCASE }}
+          tag: ${{ steps.version.outputs.idrive_version }}
+
+      # Check the base image against the current IDrive version tag (not :latest, which
+      # lags behind by LATEST_MIN_AGE_DAYS and would otherwise rebuild on every daily run).
+      - name: Check for new base image
+        if: >-
+          github.event_name != 'push' &&
+          github.event_name != 'pull_request' &&
+          steps.check-image.outputs.exists == 'true' &&
+          steps.check-version.outputs.tag != 'not found'
+        id: check-base
+        uses: lucacome/docker-image-update-checker@958e0b396cd5227e7da180826286ef48c20296f9 # v3.1.2
+        with:
+          base-image: debian:trixie-slim
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}
+
+      # Single source of truth for the build decision; the Build Summary below reads
+      # the same outputs rather than restating the condition.
+      - name: Decide whether to build
+        id: decide
+        env:
+          REQUESTED: ${{ inputs.promote_version }}
+          EVENT: ${{ github.event_name }}
+          IMAGE_EXISTS: ${{ steps.check-image.outputs.exists }}
+          BASE_STALE: ${{ steps.check-base.outputs.needs-updating }}
+          VERSION_TAG: ${{ steps.check-version.outputs.tag }}
+        run: |
+          build=false
+          if   [ -n "$REQUESTED" ];            then reason="rollback request; nothing to build"
+          elif [ "$EVENT" = "push" ];          then build=true; reason="push to main"
+          elif [ "$EVENT" = "pull_request" ];  then build=true; reason="pull request (test only, no push)"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then build=true; reason="manual dispatch"
+          elif [ "$IMAGE_EXISTS" = "false" ];  then build=true; reason="image does not exist yet"
+          elif [ "$BASE_STALE" = "true" ];     then build=true; reason="base image updated"
+          elif [ "$VERSION_TAG" = "not found" ]; then build=true; reason="new iDrive version"
+          else reason="no updates available"
+          fi
+          echo "build=$build"   >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "build=$build ($reason)"
+
+  # Build each architecture on a native runner and run the smoke test before anything
+  # is published. ubuntu-24.04-arm is free for public repositories; a private fork
+  # without ARM runners can use ubuntu-latest for both (arm64 then runs under QEMU).
+  verify:
+    name: Smoke test (${{ matrix.arch }})
+    needs: decide
+    if: needs.decide.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.arch }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: IDRIVE_URL=${{ needs.decide.outputs.idrive_URL }}
+          tags: idrive-docker:smoke
+          load: true
+
+      - name: Smoke test
+        run: ./tests/smoke-test.sh idrive-docker:smoke
+
+  build-and-push-docker-image:
+    name: Build Docker image and push to repositories
+    needs: [decide, verify]
+    # verify is skipped when there is nothing to build; promoting :latest must still run then.
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.decide.result == 'success' &&
+      (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Sanitize Repository Name
+        env:
+          RAW_IMAGE_NAME: ${{ github.repository }}
+        run: |
+          echo "IMAGE_LOWERCASE=$(echo "$RAW_IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          # Bare repo name (no owner), used for the image title label.
+          echo "REPO_NAME=${RAW_IMAGE_NAME#*/}" >> "$GITHUB_ENV"
 
       - name: Check DockerHub Secrets
         id: check-secrets
@@ -86,49 +249,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # --- NEW: Check if the image currently exists in the registry ---
-      - name: Check if image exists in GHCR
-        id: check-image
-        if: github.event_name != 'push'
-        run: |
-          # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
-          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
-          if docker manifest inspect "$IMAGE_REF" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # --- UPDATED: Only run update checkers if the image already exists ---
-      - name: Check for new base image
-        if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
-        id: check-base
-        uses: lucacome/docker-image-update-checker@958e0b396cd5227e7da180826286ef48c20296f9 # v3.1.2
-        with:
-          base-image: debian:trixie-slim
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest
-
-      - name: Check for new iDrive version
-        if: github.event_name != 'push' && steps.check-image.outputs.exists == 'true'
-        id: check-version
-        uses: tyriis/docker-image-tag-exists@e73c8fdfab85076cdcf2ce4b443181fae2153675 # v2026.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          repository: ${{ env.IMAGE_LOWERCASE }}
-          tag: ${{ steps.version.outputs.idrive_version }}
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-      
+
       - name: Generate Dynamic Docker Tags
         id: generate-tags
+        if: needs.decide.outputs.build == 'true'
         env:
           DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           # Version tags only. :latest is moved separately, by the promote step below,
           # once the release has aged past LATEST_MIN_AGE_DAYS. version.sh exits
           # non-zero when it cannot resolve a version, so this is never empty.
-          VERSION="${{ steps.version.outputs.idrive_version }}"
+          VERSION="${{ needs.decide.outputs.idrive_version }}"
           TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:$VERSION"
 
           # Append the DockerHub tag only if DockerHub secrets are present
@@ -143,39 +276,15 @@ jobs:
           # RFC 3339 timestamp for org.opencontainers.image.created
           echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      # Single source of truth for the build decision; the Build Summary below reads
-      # the same outputs rather than restating the condition.
-      - name: Decide whether to build
-        id: decide
-        env:
-          REQUESTED: ${{ inputs.promote_version }}
-          EVENT: ${{ github.event_name }}
-          IMAGE_EXISTS: ${{ steps.check-image.outputs.exists }}
-          BASE_STALE: ${{ steps.check-base.outputs.needs-updating }}
-          VERSION_TAG: ${{ steps.check-version.outputs.tag }}
-        run: |
-          build=false
-          if   [ -n "$REQUESTED" ];            then reason="rollback request; nothing to build"
-          elif [ "$EVENT" = "push" ];          then build=true; reason="push to main"
-          elif [ "$EVENT" = "workflow_dispatch" ]; then build=true; reason="manual dispatch"
-          elif [ "$IMAGE_EXISTS" = "false" ];  then build=true; reason="image does not exist yet"
-          elif [ "$BASE_STALE" = "true" ];     then build=true; reason="base image updated"
-          elif [ "$VERSION_TAG" = "not found" ]; then build=true; reason="new iDrive version"
-          else reason="no updates available"
-          fi
-          echo "build=$build"   >> "$GITHUB_OUTPUT"
-          echo "reason=$reason" >> "$GITHUB_OUTPUT"
-          echo "build=$build ($reason)"
-
       - name: Build image and push
-        if: steps.decide.outputs.build == 'true'
+        if: needs.decide.outputs.build == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           tags: ${{ steps.generate-tags.outputs.tags }}
           # Passed as a buildkit input (not evaluated by a runner shell). version.sh
           # exits non-zero if the URL is unresolved, so we never reach here empty.
-          build-args: IDRIVE_URL=${{ steps.version.outputs.idrive_URL }}
+          build-args: IDRIVE_URL=${{ needs.decide.outputs.idrive_URL }}
           # OCI image labels. Everything repo-specific derives from the github context
           # rather than being hardcoded, so a fork labels its images with its own
           # repository instead of inheriting the upstream one.
@@ -191,7 +300,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.licenses=GPL-3.0
-            org.opencontainers.image.version=${{ steps.version.outputs.idrive_version }}
+            org.opencontainers.image.version=${{ needs.decide.outputs.idrive_version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.generate-tags.outputs.build_date }}
           push: ${{ github.ref == 'refs/heads/main' }}
@@ -219,14 +328,14 @@ jobs:
             TARGET="$REQUESTED"
             WHY="manual rollback to $TARGET"
           else
-            TARGET="${{ steps.version.outputs.idrive_version }}"
-            AGE="${{ steps.version.outputs.idrive_age_days }}"
+            TARGET="${{ needs.decide.outputs.idrive_version }}"
+            AGE="${{ needs.decide.outputs.idrive_age_days }}"
 
             # If :latest does not exist yet there is nothing to protect, so publish it
             # regardless of age. (check-image is skipped on push events, hence the
             # explicit 'false' test rather than a truthiness check.)
             BOOTSTRAP=false
-            [ "${{ steps.check-image.outputs.exists }}" = "false" ] && BOOTSTRAP=true
+            [ "${{ needs.decide.outputs.image_exists }}" = "false" ] && BOOTSTRAP=true
 
             if [ "$BOOTSTRAP" = "true" ]; then
               WHY="bootstrap (:latest did not exist)"
@@ -269,12 +378,12 @@ jobs:
           {
             echo "## Build Summary"
             echo "**Event:** ${{ github.event_name }}"
-            echo "**iDrive version detected:** ${{ steps.version.outputs.idrive_version || 'no (version-check failed)' }}"
-            echo "**Release date:** ${{ steps.version.outputs.idrive_release_date || 'unknown' }} (${{ steps.version.outputs.idrive_age_days || '?' }} days old)"
-            echo "**Image already exists:** ${{ steps.check-image.outputs.exists || 'n/a (push event)' }}"
-            echo "**Base image needs updating:** ${{ steps.check-base.outputs.needs-updating || 'n/a' }}"
-            echo "**Existing version tag found:** ${{ steps.check-version.outputs.tag || 'n/a' }}"
-            echo "**Built:** ${{ steps.decide.outputs.build || 'n/a' }} — ${{ steps.decide.outputs.reason || 'step did not run' }}"
+            echo "**iDrive version detected:** ${{ needs.decide.outputs.idrive_version || 'no (version-check failed)' }}"
+            echo "**Release date:** ${{ needs.decide.outputs.idrive_release_date || 'unknown' }} (${{ needs.decide.outputs.idrive_age_days || '?' }} days old)"
+            echo "**Image already exists:** ${{ needs.decide.outputs.image_exists || 'n/a (push event)' }}"
+            echo "**Base image needs updating:** ${{ needs.decide.outputs.base_stale || 'n/a' }}"
+            echo "**Existing version tag found:** ${{ needs.decide.outputs.version_tag || 'n/a' }}"
+            echo "**Built:** ${{ needs.decide.outputs.build || 'n/a' }} — ${{ needs.decide.outputs.reason || 'step did not run' }}"
             echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
             echo ""
             echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"

@@ -82,9 +82,16 @@ Be advised, that the containers timezone is UTC and so are the backup times and 
 
 
 ## Development
+Every pull request that changes the image is built for `amd64` and `arm64` and checked
+with the offline smoke test before anything is published. Run it against a local build:
+```shell
+docker build -t idrive-docker:local .
+./tests/smoke-test.sh idrive-docker:local
+```
+
 The `Lint` workflow checks every change. Run the same checks locally (only Docker needed):
 ```shell
 docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < Dockerfile
-docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh
+docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh tests/*.sh
 docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7
 ```
