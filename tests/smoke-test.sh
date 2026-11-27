@@ -152,6 +152,9 @@ unhealthy_after() {  # unhealthy_after <description> <command run in the contain
 # shellcheck disable=SC2016  # expanded inside the container, not here
 enc='enc() { printf "%s" "$1" > /tmp/p; /opt/IDriveForLinux/bin/idrive --utilities ENCRYPT /tmp/p "$2" >/dev/null; }'
 unhealthy_after "logout" "$enc; enc '{\"root\":{\"isLoggedin\":0,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
+# A logout makes idrivecron replace itself with a new process; the container must survive that.
+sleep 15
+[ "$(docker inspect --format '{{.State.Running}}' "$c")" = true ] || fail "container stopped when idrivecron restarted itself"
 docker exec "$c" bash -c "$enc; enc '{\"root\":{\"isLoggedin\":1,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
 docker exec "$c" idrive-init.py healthcheck || fail "health check failed after logging back in"
 unhealthy_after "missing IDPWD" "mv /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPWD /tmp/"
@@ -224,7 +227,11 @@ for bad in ("not!valid!base32", "otpauth://hotp/x?secret=GEZDGNBV"):
     except ValueError:
         pass
 assert m.scrub("user bob@example.com bobcat bob", ["bob@example.com"]) == "user <REDACTED> bobcat <REDACTED>"
-' || fail "TOTP / scrub unit checks"
+s = m.LoginSettings("u", "p", "DEFAULT", "", None, "", "", ["p", "u", "", "", ""])
+st = {"salt": "not-hex"}
+fp = m.settings_fingerprint(st, s)
+assert len(fp) == 64 and len(bytes.fromhex(st["salt"])) == 16
+' || fail "TOTP / scrub / settings unit checks"
 for args in "IDRIVE_ACCOUNT=u IDRIVE_PASSWORD=p IDRIVE_BACKUP_LOCATION=bad#name" \
             "IDRIVE_ACCOUNT=u IDRIVE_PASSWORD=p IDRIVE_TOTP_SECRET=not!valid" \
             "IDRIVE_ACCOUNT=u" \
@@ -258,5 +265,85 @@ env -u IDRIVE_PASSWORD idrive-init.py healthcheck
 ' || fail "credential scrubbing or credentials-configured health rule"
 docker stop -t 10 "$c" >/dev/null
 echo "[9] Credentials kept out of IDrive's processes; unconfigured + credentials = unhealthy"
+
+# 10. Login backoff and pause rules (state file in /tmp, no network).
+docker run --rm --entrypoint python3 "$IMAGE" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("m", "/usr/local/bin/idrive-init.py")
+m = importlib.util.module_from_spec(spec); sys.modules["m"] = m; spec.loader.exec_module(m)
+m.CACHE_DIR = "/tmp"; m.LOGIN_STATE_FILE = "/tmp/autologin-state.json"
+assert [m.backoff_seconds(n) for n in range(9)] == [0, 300, 600, 1200, 2400, 4800, 9600, 19200, 21600]
+assert m.classify_failure("Error: Invalid username or Password") == "credentials"
+assert m.classify_failure("RATE_LIMITER_BLOCKED") == "rate-limited"
+assert m.classify_failure("Connection timed out") == "error"
+st = {}
+m.record_login_result(st, m.LoginResult(False, "error", "network")); st["last_attempt"] = 1000
+assert st["failures"] == 1 and not st.get("blocked")
+assert m.login_gate(st, 1299) is not None and m.login_gate(st, 1300) is None
+m.record_login_result(st, m.LoginResult(False, "credentials", "bad password"))
+assert st["blocked"] and "paused" in m.login_gate(st, 10**10)
+st["problem_since"] = 1000; st["last_notice"] = 1000
+m.record_login_result(st, m.LoginResult(True, totp_counter=42))
+assert st["failures"] == 0 and not st["blocked"] and st["last_totp_counter"] == 42
+assert "problem_since" not in st and "last_notice" not in st
+m.record_login_result(st, m.LoginResult(False, "rate-limited", "locked"))
+assert m.backoff_seconds(st["failures"]) == 21600 and m.load_login_state() == st
+' || fail "backoff unit checks"
+# An unreadable CONFIGURATION_FILE (logged out) must not log in, and must back off like a failed
+# login so the watchdog does not restart the container every few minutes.
+docker run --rm -e IDRIVE_ACCOUNT=smokeuser -e IDRIVE_PASSWORD=unused --entrypoint bash "$IMAGE" -c '
+set -uo pipefail
+v=/opt/IDriveForLinux/idriveIt; tar -xzf /opt/IDriveForLinux/idriveIt.orig.tar.gz -C /opt/IDriveForLinux
+p=$v/user_profile/root/smokeuser; mkdir -p "$p/.userInfo"; printf garbage > "$p/CONFIGURATION_FILE"
+printf "%s" "{\"root\":{\"isLoggedin\":0,\"userid\":\"smokeuser\"}}" > /tmp/p
+/opt/IDriveForLinux/bin/idrive --utilities ENCRYPT /tmp/p "$v/cache/idriveuser.txt" >/dev/null
+out=$(idrive-init.py autologin 2>&1) && exit 1
+grep -q "will retry in 5 min" <<<"$out" || { echo "$out" >&2; exit 1; }
+out=$(idrive-init.py autologin 2>&1) && exit 1
+grep -q "backing off after 1 failed" <<<"$out" || { echo "$out" >&2; exit 1; }
+' || fail "unreadable CONFIGURATION_FILE backs off"
+echo "[10] Login backoff: 5 min doubling to 6 h, pause on credential errors, reset on success, unreadable config"
+
+# 11. Watchdog: leaves a healthy session alone, exits 3 after a logout (two checks in a row).
+#     The account is logged in at start, so autologin never contacts IDrive.
+vol="${RUN_ID}-wd"
+c="${RUN_ID}-wd"
+docker volume create "$vol" >/dev/null
+VOLUMES+=("$vol")
+CONTAINERS+=("$c")
+seed_account "$vol" 1 ACTIVE ""
+docker run -d --name "$c" -e IDRIVE_ACCOUNT=smokeuser -e IDRIVE_PASSWORD=unused -e IDRIVE_WATCHDOG_INTERVAL=3 \
+    -v "$vol:/opt/IDriveForLinux/idriveIt" "$IMAGE" >/dev/null
+sleep 10
+logs_contain "$c" "Account already logged in" || fail "autologin did not skip a logged-in account"
+[ "$(docker inspect --format '{{.State.Running}}' "$c")" = true ] || fail "watchdog restarted a healthy session"
+docker exec "$c" bash -c "$enc; enc '{\"root\":{\"isLoggedin\":0,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
+for _ in $(seq 1 30); do
+    [ "$(docker inspect --format '{{.State.Running}}' "$c")" = false ] && break
+    sleep 1
+done
+rc=$(docker inspect --format '{{.State.ExitCode}}' "$c")
+[ "$rc" = 3 ] || fail "expected watchdog exit code 3 after a logout, got $rc"
+logs_contain "$c" "restarting the container to log in again" || fail "missing watchdog restart message"
+echo "[11] Watchdog leaves a healthy session alone and exits 3 after a logout"
+
+# 12. A configuration error (here: credentials for another account) pauses automated login,
+#     so the watchdog must not restart; reset-login clears the pause.
+c="${RUN_ID}-wd2"
+CONTAINERS+=("$c")
+docker run -d --name "$c" -e IDRIVE_ACCOUNT=someone-else -e IDRIVE_PASSWORD=unused -e IDRIVE_WATCHDOG_INTERVAL=3 \
+    -v "$vol:/opt/IDriveForLinux/idriveIt" "$IMAGE" >/dev/null
+sleep 20
+[ "$(docker inspect --format '{{.State.Running}}' "$c")" = true ] || fail "watchdog restarted despite a paused login"
+logs_contain "$c" "automated login paused after" || fail "missing paused-login notice"
+docker exec "$c" bash -c '
+set -euo pipefail
+f=/opt/IDriveForLinux/idriveIt/cache/autologin-state.json
+python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"blocked\"] is True" "$f"
+idrive-init.py reset-login >/dev/null
+python3 -c "import json,sys; assert not json.load(open(sys.argv[1])).get(\"blocked\")" "$f"
+' || fail "pause state or reset-login"
+docker stop -t 10 "$c" >/dev/null
+echo "[12] A paused login blocks watchdog restarts; reset-login clears it"
 
 echo "PASS: smoke test for $IMAGE"

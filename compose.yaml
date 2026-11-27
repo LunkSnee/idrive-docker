@@ -15,6 +15,8 @@ services:
       # Writable folder to restore files into:
       # - /path/to/restore:/restore
     restart: unless-stopped
+    # Matches start.sh's 6s graceful drain before stopping idrivecron cleanly.
+    stop_grace_period: 15s
     # TZ and the other settings come from .env (copy .env.example to .env; optional).
     env_file:
       - path: .env

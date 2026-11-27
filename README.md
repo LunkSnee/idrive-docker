@@ -124,6 +124,28 @@ on the Docker host has both factors. Without a key, log in by hand with
 With credentials configured, `(healthy)` also requires the account to be set up, so a failed
 first setup shows as unhealthy instead of "waiting for setup".
 
+### Logouts while running (watchdog)
+IDrive can also log itself out while it runs, for example after server errors such as
+`password mismatch`, `failed to get the device information` or `invalid device id`. With
+automated login configured, the container recovers by itself:
+
+- **Watchdog:** every `IDRIVE_WATCHDOG_INTERVAL` seconds (default `300`, `0` turns it off) the
+  container checks the login. If the account is logged out (or its schedule switched off) on two
+  checks in a row, the container exits with code `3`, Docker's restart policy starts it again,
+  and it logs in. Keep `restart: unless-stopped`: without a restart policy it just stops.
+- **Backoff:** failed logins are retried after 5 min, 10 min, 20 min and so on, up to 6 h, even
+  across restarts. The record is `cache/autologin-state.json` on the config volume (times,
+  counts and the last error; no passwords).
+- **Pause on credential errors:** a wrong password, rejected 2FA code, blocked account or an
+  invalid setting stops automated login completely, so it can never lock the account. It resumes
+  by itself once you change the credentials or settings and restart the container. To retry the
+  same ones, for example after IDrive unblocked the account:
+  ```shell
+  docker exec idrive idrive-init.py reset-login && docker restart idrive
+  ```
+
+Without credentials, the watchdog only writes a reminder to the log.
+
 ## Backup configuration
 The configuration and operation of backup and restore can be done in the IDrive GUI. Help can be found on the [IDrive FAQs](https://www.idrive.com/faq_linux#linuxWeb2) for Linux.
 

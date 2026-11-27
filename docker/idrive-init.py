@@ -11,6 +11,9 @@ Commands:
   autologin    run by start.sh after prepare: optional automated setup and re-login
                from credentials (see cmd_autologin)
   healthcheck  the Docker HEALTHCHECK (see cmd_healthcheck)
+  watchdog     run by start.sh every IDRIVE_WATCHDOG_INTERVAL seconds: asks for a restart
+               (exit 3) when a logout needs automated login again (see cmd_watchdog)
+  reset-login  clear the automated-login backoff/pause (see cmd_reset_login)
 
 IDrive keeps most of its state as JSON scrambled with its own encryption; the helper reads
 and writes it with IDrive's own `idrive --utilities DECRYPT|ENCRYPT`, so the format stays
@@ -452,11 +455,20 @@ def collect_health_state() -> tuple[bool, str]:
 
     Costs two decrypts (cache/idriveuser.txt, idrivecrontab.json).
     """
+    global _timed_out
     # idrivecron replaces itself with a new process at times, with a few seconds in between
     # where none runs; look again for up to 10 s before calling it stopped.
     for attempt in range(6):
-        if run_cmd(["pgrep", "-f", "/etc/idrivecron"], timeout=5).returncode == 0:
-            break
+        timeout = _cmd_timeout(5)
+        if timeout < 1:
+            _timed_out = True
+            return False, "healthcheck budget exhausted"
+        try:
+            if run_cmd(["pgrep", "-f", "/etc/idrivecron"], timeout=timeout).returncode == 0:
+                break
+        except subprocess.TimeoutExpired:
+            _timed_out = True
+            return False, "pgrep timed out"
         if attempt == 5:
             return False, "idrivecron process is not running"
         time.sleep(2)
@@ -543,6 +555,128 @@ FAILURE_PATTERNS = (
     r"account has been (?:blocked|cancell?ed|canceled|expired)",
     r"already logged in\. Logout using",
 )
+
+# Failures that retrying with the same settings cannot fix: retrying only risks a lockout.
+CREDENTIAL_ERRORS = (
+    r"Invalid username or Password",
+    r"Invalid encryption key",
+    r"failed to authenticate user",
+    r"Two-factor authentication has failed",
+    r"failed to verify your account",
+    r"encryption verification failed",
+    r"failed to encode private key",
+    r"account has been (?:blocked|cancell?ed|canceled|expired)",
+)
+# IDrive's own lockouts: wait the maximum backoff before trying again.
+RATE_LIMIT_ERRORS = (r"exceeded the number of attempts", r"maximum count for receiving OTP", r"RATE_LIMITER_BLOCKED")
+
+# Record of automated login attempts on the config volume. Plain JSON without secrets: times,
+# counts, the last error, a salted hash of the settings (to notice when they change) and the
+# last 2FA time step used. It survives restarts, so restarts cannot hammer IDrive's servers.
+LOGIN_STATE_FILE = os.path.join(CACHE_DIR, "autologin-state.json")
+BACKOFF_BASE_S = 5 * 60
+BACKOFF_MAX_S = 6 * 60 * 60
+WATCHDOG_RESTART_RC = 3  # start.sh exits with this code when the watchdog asks for a restart
+
+
+@dataclass
+class LoginResult:
+    """Outcome of one automated --login / --account-setting run."""
+
+    ok: bool
+    category: str = ""  # "credentials", "config", "rate-limited" or "error" when not ok
+    message: str = ""
+    totp_counter: int | None = None  # last 2FA time step used, persisted across restarts
+
+
+def classify_failure(output: str) -> str:
+    """'credentials', 'rate-limited' or 'error' for a failed login transcript."""
+    if any(re.search(p, output, re.I) for p in CREDENTIAL_ERRORS):
+        return "credentials"
+    if any(re.search(p, output, re.I) for p in RATE_LIMIT_ERRORS):
+        return "rate-limited"
+    return "error"
+
+
+def load_login_state() -> dict[str, Any]:
+    try:
+        with open(LOGIN_STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_login_state(state: dict[str, Any]) -> None:
+    """Write the record atomically (mode 0600, from mkstemp)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".autologin-state.", dir=CACHE_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+    os.replace(tmp_path, LOGIN_STATE_FILE)
+
+
+def settings_fingerprint(state: dict[str, Any], s: LoginSettings) -> str:
+    """Salted, slow hash of the login settings; only used to notice that they changed."""
+    salt_bytes = b""
+    if isinstance(state.get("salt"), str) and state["salt"]:
+        try:
+            salt_bytes = bytes.fromhex(state["salt"])
+        except ValueError:
+            salt_bytes = b""
+    if not salt_bytes:
+        salt_bytes = os.urandom(16)
+        state["salt"] = salt_bytes.hex()
+    material = "\0".join([s.account, s.password, s.enc_key, s.totp_raw, s.enc_type, s.backup_loc]).encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha256", material, salt_bytes, 200_000).hex()
+
+
+def backoff_seconds(failures: int) -> int:
+    """5 min, 10 min, 20 min, ... capped at 6 h."""
+    return 0 if failures <= 0 else min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S)
+
+
+def login_gate(state: dict[str, Any], now: float) -> str | None:
+    """Why an automated login must not be attempted now, or None when it may go ahead."""
+    if state.get("blocked"):
+        return (
+            f"paused after: {str(state.get('last_error') or 'a credential error').rstrip('.')}. "
+            "Fix the credentials/settings and restart the container, or run 'idrive-init.py reset-login' to retry the same ones"
+        )
+    wait_s = int(state.get("last_attempt", 0)) + backoff_seconds(int(state.get("failures", 0))) - now
+    if wait_s > 0:
+        return f"backing off after {state.get('failures')} failed attempt(s); next attempt in {int(wait_s // 60) + 1} min"
+    return None
+
+
+def record_login_result(state: dict[str, Any], result: LoginResult) -> None:
+    """Persist an attempt's outcome: success clears the record; credential and configuration
+    errors pause automated login; IDrive's rate limits wait the maximum backoff."""
+    if result.totp_counter is not None:
+        state["last_totp_counter"] = result.totp_counter
+    if result.ok:
+        state.update({"failures": 0, "blocked": False, "last_error": "", "last_success": int(time.time())})
+        state.pop("problem_since", None)
+        state.pop("last_notice", None)
+    else:
+        state["failures"] = int(state.get("failures", 0)) + 1
+        state["last_error"] = result.message
+        if result.category in ("credentials", "config"):
+            state["blocked"] = True
+        elif result.category == "rate-limited":
+            state["failures"] = max(state["failures"], 8)
+    save_login_state(state)
+
+
+def autologin_config_error(message: str) -> int:
+    """Report a configuration problem and pause automated login until the settings change.
+    (Otherwise the watchdog would restart the container over and over for nothing.)"""
+    print(f"[autologin] ERROR: {message}", file=sys.stderr)
+    state = load_login_state()
+    state.update({"blocked": True, "last_error": message})
+    state.pop("fingerprint", None)  # any corrected configuration then counts as changed
+    save_login_state(state)
+    return 1
 
 
 @dataclass
@@ -876,7 +1010,7 @@ def rename_backup_location_if_needed(profile_dir: str, desired_name: str, secret
 
 
 
-def _base_auth_state() -> dict[str, Any]:
+def _base_auth_state(last_totp_counter: int | None = None) -> dict[str, Any]:
     """Which shared prompts have been answered (each is answered once)."""
     return {
         "method": False,
@@ -887,7 +1021,8 @@ def _base_auth_state() -> dict[str, Any]:
         "missing_key": False,
         "totp_menu_count": 0,
         "otp_attempts": 0,
-        "last_totp_counter": None,
+        # Persisted across restarts, so a quick restart never re-sends a code IDrive already used.
+        "last_totp_counter": last_totp_counter,
         "missing_totp": False,
         "totp_failed": False,
         "trust_answered": False,
@@ -961,23 +1096,26 @@ def handle_auth_prompts(tail: str, buf_len: int, state: dict[str, Any], write_fn
     return None
 
 
-def _report_failure(state: dict[str, Any], rc: int, out: str, logged_in: int, cmd: str) -> None:
-    """Print why an automated login failed (the transcript is already scrubbed)."""
+def _report_failure(state: dict[str, Any], rc: int, out: str, logged_in: int, cmd: str) -> LoginResult:
+    """Print why an automated login failed (the transcript is already scrubbed) and classify it."""
     if state["missing_key"]:
-        msg = "IDRIVE_ENCRYPTION_KEY is required for this account's private encryption key"
+        msg, category = "IDRIVE_ENCRYPTION_KEY is required for this account's private encryption key", "config"
     elif state["missing_totp"]:
         msg = f"two-factor authentication requested; set IDRIVE_TOTP_SECRET_FILE or run 'idrive {cmd}' interactively"
+        category = "config"
     elif state["totp_failed"]:
-        msg = "two-factor code was rejected after retry; verify IDRIVE_TOTP_SECRET and the host clock"
+        msg, category = "two-factor code was rejected after retry; verify IDRIVE_TOTP_SECRET and the host clock", "credentials"
     else:
-        msg = f"idrive {cmd} failed (rc={rc}, logged_in={logged_in})"
+        category = classify_failure(out)
+        msg = f"idrive {cmd} failed (rc={rc}, logged_in={logged_in}, cause={category})"
         print(out[-2500:], file=sys.stderr)
     print(f"[autologin] ERROR: {msg}.", file=sys.stderr)
+    return LoginResult(False, category, msg, state["last_totp_counter"])
 
 
-def run_login_flow(s: LoginSettings) -> bool:
+def run_login_flow(s: LoginSettings, last_totp_counter: int | None = None) -> LoginResult:
     """Log an existing account back in with `idrive --login`."""
-    state = _base_auth_state()
+    state = _base_auth_state(last_totp_counter)
 
     def handle(buf: str, write_fn) -> int | str | None:
         tail = buf[-1500:]
@@ -992,19 +1130,18 @@ def run_login_flow(s: LoginSettings) -> bool:
     rc, out = pty_interact(["--login"], handle, s.secrets, timeout_s=150)
     _, logged_in = get_idriveuser_state()
     if state["missing_key"] or state["missing_totp"] or state["totp_failed"] or rc != 0 or logged_in != 1:
-        _report_failure(state, rc, out, logged_in, "--login")
-        return False
-    return True
+        return _report_failure(state, rc, out, logged_in, "--login")
+    return LoginResult(True, totp_counter=state["last_totp_counter"])
 
 
-def run_account_setting_flow(s: LoginSettings) -> bool:
+def run_account_setting_flow(s: LoginSettings, last_totp_counter: int | None = None) -> LoginResult:
     """Set up an empty volume with `idrive --account-setting`.
 
     Backup location: with IDRIVE_BACKUP_LOCATION set, an existing location of that name is
     reused, otherwise a new one is created (and renamed to it afterwards, see
     rename_backup_location_if_needed). Saved settings of a reused location are not copied.
     """
-    state = _base_auth_state()
+    state = _base_auth_state(last_totp_counter)
     state.update({"enc_choice": False, "set_key": False, "conf_key": False, "checked_existing": False, "enter_loc": False, "proxy_seen": 0})
 
     def handle(buf: str, write_fn) -> int | str | None:
@@ -1069,9 +1206,8 @@ def run_account_setting_flow(s: LoginSettings) -> bool:
     rc, out = pty_interact(["--account-setting"], handle, s.secrets, timeout_s=180)
     _, logged_in = get_idriveuser_state()
     if state["missing_key"] or state["missing_totp"] or state["totp_failed"] or rc != 0 or logged_in != 1:
-        _report_failure(state, rc, out, logged_in, "--account-setting")
-        return False
-    return True
+        return _report_failure(state, rc, out, logged_in, "--account-setting")
+    return LoginResult(True, totp_counter=state["last_totp_counter"])
 
 
 def read_login_settings() -> LoginSettings | None:
@@ -1104,15 +1240,47 @@ def read_login_settings() -> LoginSettings | None:
 def cmd_autologin() -> int:
     """Run by start.sh after prepare. Does nothing without credentials or when already logged in;
     logs a logged-out account back in; sets up an empty volume. Exit 1 on failure (start.sh
-    still starts IDrive, and the health check reports the problem)."""
+    still starts IDrive, and the health check reports the problem).
+
+    Every attempt goes through the attempt record: failures back off, and credential or
+    configuration errors pause automated login until the settings change."""
     try:
         s = read_login_settings()
     except ValueError as exc:
-        print(f"[autologin] ERROR: {exc}", file=sys.stderr)
-        return 1
+        return autologin_config_error(str(exc))
     if s is None:
         print("[autologin] Credentials not provided; skipping automated login.")
         return 0
+
+    # Changed credentials or settings clear any earlier backoff or pause.
+    login_state = load_login_state()
+    fingerprint = settings_fingerprint(login_state, s)
+    if login_state.get("fingerprint") != fingerprint:
+        if login_state.get("failures") or login_state.get("blocked"):
+            print("[autologin] Credentials or settings changed; clearing earlier login failures.")
+        login_state = {"salt": login_state["salt"], "fingerprint": fingerprint, "last_totp_counter": login_state.get("last_totp_counter")}
+        save_login_state(login_state)
+
+    def attempt(flow, banner: str = "") -> LoginResult | None:
+        """Run a login flow unless backoff or a pause forbids it (None then)."""
+        reason = login_gate(login_state, time.time())
+        if reason:
+            print(f"[autologin] Skipping automated login: {reason}.", file=sys.stderr)
+            return None
+        if banner:
+            print(banner)
+        login_state["last_attempt"] = int(time.time())
+        save_login_state(login_state)
+        result = flow(s, login_state.get("last_totp_counter"))
+        stop_idrive_daemons()  # the login may start IDrive services; start.sh starts them itself
+        record_login_result(login_state, result)
+        if not result.ok and login_state.get("blocked"):
+            print("[autologin] Automated login is paused until the credentials/settings change "
+                  "(or 'idrive-init.py reset-login' is run), so the IDrive account cannot be locked.", file=sys.stderr)
+        elif not result.ok:
+            print(f"[autologin] Will retry in {backoff_seconds(login_state['failures']) // 60} min "
+                  "(the watchdog restarts the container when it is due).", file=sys.stderr)
+        return result
 
     user_id, logged_in = get_idriveuser_state()
     pdir = resolve_profile_dir(user_id)
@@ -1121,7 +1289,16 @@ def cmd_autologin() -> int:
     if pdir and os.path.isfile(cfg_path):
         cfg, _ = decrypt_json_file(cfg_path)
         if not isinstance(cfg, dict):
-            print("[autologin] ERROR: Could not read CONFIGURATION_FILE; skipping automated login for now.", file=sys.stderr)
+            # Without it the account cannot be checked, so do not log in. Count it as a failed
+            # attempt, so the watchdog's restarts back off instead of repeating every few minutes.
+            reason = login_gate(login_state, time.time())
+            if reason:
+                print(f"[autologin] Skipping automated login: {reason}.", file=sys.stderr)
+                return 1
+            login_state["last_attempt"] = int(time.time())
+            record_login_result(login_state, LoginResult(False, "error", "could not read CONFIGURATION_FILE"))
+            print("[autologin] ERROR: Could not read CONFIGURATION_FILE; will retry in "
+                  f"{backoff_seconds(login_state['failures']) // 60} min.", file=sys.stderr)
             return 1
         # Never log a volume set up for one account into another.
         existing_ids = {
@@ -1130,34 +1307,27 @@ def cmd_autologin() -> int:
             if (val := str(raw or "").strip())
         }
         if s.account.lower() not in existing_ids:
-            print(
-                "[autologin] ERROR: Volume already contains a configured profile for another account; "
-                "refusing to overwrite existing backup metadata.",
-                file=sys.stderr,
+            return autologin_config_error(
+                "Volume already contains a configured profile for another account; refusing to overwrite existing backup metadata."
             )
-            return 1
         if str(cfg_get(cfg, "ENCRYPTIONTYPE", "DEFAULT")).upper() == "PRIVATE" and not s.enc_key:
-            print("[autologin] ERROR: Existing profile uses PRIVATE encryption; IDRIVE_ENCRYPTION_KEY is required.", file=sys.stderr)
-            return 1
+            return autologin_config_error("Existing profile uses PRIVATE encryption; IDRIVE_ENCRYPTION_KEY is required.")
         cron_data, _ = decrypt_json_file(CRONTAB_FILE)
         inactive = (get_cron_status(cron_data, user_id) or "").upper() == "INACTIVE"
         if logged_in == 1 and not inactive:
             print("[autologin] Account already logged in and active; skipping automated login.")
             return 0
-        if logged_in == 1:  # logged in, but IDrive switched the schedule off: log in again
+        if login_gate(login_state, time.time()) is None and logged_in == 1:
+            # Logged in, but IDrive switched the schedule off: log out, then in again.
             run_cmd([IDRIVE_BIN, "--logout", "1", "0"], timeout=30)
-        print("[autologin] Restoring session via idrive --login...")
-        ok = run_login_flow(s)
-        stop_idrive_daemons()  # the login may start IDrive services; start.sh starts them itself
-        if not ok:
+        result = attempt(run_login_flow, "[autologin] Restoring session via idrive --login...")
+        if not (result and result.ok):
             return 1
         print("[autologin] Session restored successfully.")
         return cmd_prepare(quiet=True)
 
-    print("[autologin] Configuring unconfigured volume via idrive --account-setting...")
-    ok = run_account_setting_flow(s)
-    stop_idrive_daemons()
-    if not ok:
+    result = attempt(run_account_setting_flow, "[autologin] Configuring unconfigured volume via idrive --account-setting...")
+    if not (result and result.ok):
         return 1
     new_user_id, _ = get_idriveuser_state()
     new_pdir = resolve_profile_dir(new_user_id)
@@ -1171,10 +1341,82 @@ def cmd_autologin() -> int:
     return prep_rc
 
 
+# ---------------------------------------------------------------------------------------------
+# watchdog: recover from logouts that happen while the container runs
+# ---------------------------------------------------------------------------------------------
+def watchdog_check() -> tuple[bool, str]:
+    """(session_ok, problem)."""
+    if not is_already_initialized():
+        return False, "account is not configured"
+    user_id, logged_in = get_idriveuser_state()
+    if logged_in != 1:
+        return False, "account is logged out"
+    cron_data, _ = decrypt_json_file(CRONTAB_FILE)
+    if (get_cron_status(cron_data, user_id) or "").upper() == "INACTIVE":
+        return False, "backup schedule is INACTIVE"
+    return True, "ok"
+
+
+def cmd_watchdog() -> int:
+    """Run by start.sh every IDRIVE_WATCHDOG_INTERVAL seconds.
+
+    IDrive also logs out while running (for example on server errors such as "password
+    mismatch" or "invalid device id"). When credentials are configured and the problem is seen
+    on two checks in a row (the first may be a login in progress), exit WATCHDOG_RESTART_RC:
+    start.sh then exits, Docker's restart policy starts a fresh container, and its startup
+    login runs. Backoff and pauses from the attempt record are honoured, so this cannot loop.
+    Without credentials it only logs a reminder."""
+    can_login = os.environ.get("IDRIVE_AUTOLOGIN_AVAILABLE") == "1"  # set by start.sh
+    session_ok, problem = watchdog_check()
+    state = load_login_state()
+    if session_ok or (problem == "account is not configured" and not can_login):
+        if state.pop("problem_since", None) is not None:
+            save_login_state(state)
+        return 0
+
+    now = int(time.time())
+    gate = login_gate(state, now) if can_login else None
+    if "problem_since" not in state:
+        state["problem_since"] = now
+        save_login_state(state)
+        if not can_login:
+            hint = "log in with: docker exec -it <container> idrive --login"
+        else:
+            hint = f"automated login {gate}" if gate else "will re-login automatically"
+        print(f"[watchdog] IDrive {problem}; {hint}.", file=sys.stderr)
+        return 0
+    if not can_login:
+        return 0
+    if gate:
+        if now - int(state.get("last_notice", 0)) >= 3600:  # remind at most hourly
+            state["last_notice"] = now
+            save_login_state(state)
+            print(f"[watchdog] IDrive {problem}; automated login {gate}.", file=sys.stderr)
+        return 0
+    print(f"[watchdog] IDrive {problem}; restarting the container to log in again.", file=sys.stderr)
+    return WATCHDOG_RESTART_RC
+
+
+def cmd_reset_login() -> int:
+    """Clear backoff and pause, so the next start retries automated login immediately."""
+    state = load_login_state()
+    for key in ("failures", "blocked", "last_error", "last_attempt", "problem_since", "last_notice"):
+        state.pop(key, None)
+    save_login_state(state)
+    print("[autologin] Login backoff cleared; restart the container to retry automated login now.")
+    return 0
+
+
 def main() -> int:
     # Keep stdout and stderr lines in order in `docker logs` (stdout is block-buffered when piped).
     sys.stdout.reconfigure(line_buffering=True)
-    commands = {"prepare": cmd_prepare, "autologin": cmd_autologin, "healthcheck": cmd_healthcheck}
+    commands = {
+        "prepare": cmd_prepare,
+        "autologin": cmd_autologin,
+        "healthcheck": cmd_healthcheck,
+        "watchdog": cmd_watchdog,
+        "reset-login": cmd_reset_login,
+    }
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(f"Usage: idrive-init.py {{{'|'.join(commands)}}}", file=sys.stderr)
         return 2
