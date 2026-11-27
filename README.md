@@ -15,14 +15,22 @@ docker build -t idrive-docker:latest .
 ```
 Image is tagged `idrive-docker:latest`. The image is available on GHCR. Thx to @araines, the image gets also tagged with the iDrive client version.
 - `ghcr.io/lunksnee/idrive-docker:latest`
-- `ghcr.io/lunksnee/idrive-docker:version`
+- `ghcr.io/lunksnee/idrive-docker:<version>`, e.g. `:3.17.1`
+- `ghcr.io/lunksnee/idrive-docker:<version>-r<N>`, e.g. `:3.17.1-r2`
 
 ### Which tag to use
-Version tags such as `:3.15.0` are published as soon as a new iDrive release is
-built. `:latest` is held back until a release has been public for
-`LATEST_MIN_AGE_DAYS` (7 by default, set in `.github/workflows/build-and-publish.yml`),
-so a bad iDrive release does not reach `:latest` users on day one. Pinning a
-version tag is the safest option for unattended backups, since it never moves.
+| Tag | Moves? | Use it when |
+|-----|--------|-------------|
+| `3.17.1-r2` | Never | You want a fixed, known build. Best for unattended backups. |
+| `3.17.1` | To the newest `-r<N>` build of that IDrive version | You want image fixes but not a new IDrive version. |
+| `latest` | To a new IDrive version once it has been public for 7 days | You want new IDrive versions automatically, after a short wait. |
+
+Every build gets a new `-r<N>` (starting at `r1` for each IDrive version) and a
+matching [GitHub Release](../../releases) saying why it was built. Version tags are
+published as soon as a new iDrive release is built; `:latest` is held back until a
+release has been public for `LATEST_MIN_AGE_DAYS` (7 by default, set in
+`.github/workflows/build-and-publish.yml`), so a bad iDrive release does not reach
+`:latest` users on day one.
 
 ## Run container with docker
 ```shell

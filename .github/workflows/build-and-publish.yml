@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       promote_version:
-        description: "Roll :latest back to an already-published version tag (e.g. 3.15.0). Bypasses the age gate and skips building. Leave empty for a normal run."
+        description: "Roll :latest back to an already-published version tag (e.g. 3.15.0 or 3.15.0-r2). Bypasses the age gate and skips building. Leave empty for a normal run."
         required: false
         type: string
 
@@ -71,10 +71,14 @@ jobs:
       image_exists: ${{ steps.check-image.outputs.exists }}
       base_stale: ${{ steps.check-base.outputs.needs-updating }}
       version_tag: ${{ steps.check-version.outputs.tag }}
+      revision: ${{ steps.revision.outputs.revision }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          # Full history, so every v<version>-r<N> release tag is visible when numbering.
+          fetch-depth: 0
 
       - name: Sanitize Repository Name
         env:
@@ -97,6 +101,32 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # --- NEW: Check if the image currently exists in the registry ---
+      # Each published build gets an immutable <version>-r<N> tag and a matching
+      # v<version>-r<N> GitHub Release. N is one more than the highest existing release
+      # tag for this version, and also skips any revision already in the registry (a run
+      # that pushed images but failed before creating its release leaves no git tag).
+      - name: Compute image revision
+        id: revision
+        env:
+          VERSION: ${{ steps.version.outputs.idrive_version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          rev=0
+          while IFS= read -r tag; do
+            n="${tag#"v${VERSION}-r"}"
+            case "$n" in ''|*[!0-9]*) continue ;; esac
+            n=$((10#$n))
+            [ "$n" -gt "$rev" ] && rev="$n"
+          done < <(git tag -l "v${VERSION}-r*")
+          rev=$((rev + 1))
+          if [ "$EVENT" != "pull_request" ]; then
+            while docker manifest inspect "${REGISTRY}/${IMAGE_LOWERCASE}:${VERSION}-r${rev}" >/dev/null 2>&1; do
+              rev=$((rev + 1))
+            done
+          fi
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
+          echo "Next image revision: ${VERSION}-r${rev}"
+
       - name: Check if image exists in GHCR
         id: check-image
         if: github.event_name != 'push' && github.event_name != 'pull_request'
@@ -208,7 +238,7 @@ jobs:
       (needs.verify.result == 'success' || needs.verify.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -261,20 +291,33 @@ jobs:
           # Version tags only. :latest is moved separately, by the promote step below,
           # once the release has aged past LATEST_MIN_AGE_DAYS. version.sh exits
           # non-zero when it cannot resolve a version, so this is never empty.
+          # Each repository gets the moving <version> tag and the immutable <version>-r<N>.
           VERSION="${{ needs.decide.outputs.idrive_version }}"
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:$VERSION"
+          REV_TAG="$VERSION-r${{ needs.decide.outputs.revision }}"
+          REPOS="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}"
 
-          # Append the DockerHub tag only if DockerHub secrets are present
-          if [ "${{ steps.check-secrets.outputs.has_secrets }}" == "true" ]; then
-            TAGS="$TAGS,$DOCKER_USER/idrive-docker:$VERSION"
+          # Append the DockerHub repository only if DockerHub secrets are present
+          if [ "${{ steps.check-secrets.outputs.has_secrets }}" = "true" ]; then
+            REPOS="$REPOS $DOCKER_USER/$REPO_NAME"
           fi
 
+          TAGS=""
+          for repo in $REPOS; do
+            # Revision tags never move: refuse to overwrite one that already exists.
+            if docker buildx imagetools inspect "$repo:$REV_TAG" >/dev/null 2>&1; then
+              echo "::error::$repo:$REV_TAG already exists; refusing to overwrite an immutable revision tag."
+              exit 1
+            fi
+            TAGS="${TAGS:+$TAGS,}$repo:$VERSION,$repo:$REV_TAG"
+          done
           # $TAGS is a single comma-separated line, which build-push-action accepts
-          # directly — no heredoc needed.
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-
-          # RFC 3339 timestamp for org.opencontainers.image.created
-          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # directly — no heredoc needed. build_date is RFC 3339, for
+          # org.opencontainers.image.created.
+          {
+            echo "rev_tag=$REV_TAG"
+            echo "tags=$TAGS"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build image and push
         if: needs.decide.outputs.build == 'true'
@@ -299,8 +342,8 @@ jobs:
             org.opencontainers.image.description=IDrive Linux Client in a Docker container
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.licenses=GPL-3.0
-            org.opencontainers.image.version=${{ needs.decide.outputs.idrive_version }}
+            org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.version=${{ steps.generate-tags.outputs.rev_tag }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.generate-tags.outputs.build_date }}
           push: ${{ github.ref == 'refs/heads/main' }}
@@ -356,8 +399,8 @@ jobs:
           # cannot put :latest back onto a version that breaks every backup. To
           # promote one deliberately, remove it from BLOCKED_VERSIONS.
           for bad in ${{ env.BLOCKED_VERSIONS }}; do
-            [ "$TARGET" = "$bad" ] && \
-              skip "$TARGET is listed in BLOCKED_VERSIONS; refusing to promote :latest onto a known-broken release"
+            case "$TARGET" in "$bad"|"$bad"-r*) ;; *) continue ;; esac
+            skip "$TARGET is listed in BLOCKED_VERSIONS; refusing to promote :latest onto a known-broken release"
           done
 
           # Re-point the tag at the existing multi-arch manifest. No rebuild, and the
@@ -365,12 +408,34 @@ jobs:
           docker buildx imagetools create --tag "$GHCR_REPO:latest" "$GHCR_REPO:$TARGET"
           if [ "${{ steps.check-secrets.outputs.has_secrets }}" = "true" ]; then
             docker buildx imagetools create \
-              --tag "$DOCKER_USER/idrive-docker:latest" "$DOCKER_USER/idrive-docker:$TARGET"
+              --tag "$DOCKER_USER/$REPO_NAME:latest" "$DOCKER_USER/$REPO_NAME:$TARGET"
           fi
 
           echo "promoted=true" >> "$GITHUB_OUTPUT"
           echo "reason=$WHY" >> "$GITHUB_OUTPUT"
           echo ":latest now points at $TARGET ($WHY)"
+
+      - name: Create GitHub Release
+        id: release
+        if: needs.decide.outputs.build == 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.decide.outputs.idrive_version }}
+          REV_TAG: ${{ steps.generate-tags.outputs.rev_tag }}
+          RELEASE_DATE: ${{ needs.decide.outputs.idrive_release_date }}
+          REASON: ${{ needs.decide.outputs.reason }}
+          PROMOTED: ${{ steps.promote.outputs.promoted }}
+        run: |
+          {
+            echo "- **IDrive for Linux:** \`$VERSION\` (released ${RELEASE_DATE:-unknown})"
+            echo "- **Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:$REV_TAG\` (never moves) and \`:$VERSION\`"
+            echo "- **Built because:** $REASON"
+            echo "- **\`:latest\` moved here:** ${PROMOTED:-false}"
+            echo
+          } > release-notes.md
+          gh release create "v$REV_TAG" --target "${{ github.sha }}" --title "IDrive $VERSION ($REV_TAG)" \
+            --notes-file release-notes.md --generate-notes
+          echo "created=v$REV_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build Summary
         if: always()
@@ -384,6 +449,7 @@ jobs:
             echo "**Base image needs updating:** ${{ needs.decide.outputs.base_stale || 'n/a' }}"
             echo "**Existing version tag found:** ${{ needs.decide.outputs.version_tag || 'n/a' }}"
             echo "**Built:** ${{ needs.decide.outputs.build || 'n/a' }} — ${{ needs.decide.outputs.reason || 'step did not run' }}"
+            echo "**Revision tag:** ${{ steps.generate-tags.outputs.rev_tag || 'n/a' }} (release: ${{ steps.release.outputs.created || 'none' }})"
             echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
             echo ""
             echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"

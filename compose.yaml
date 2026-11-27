@@ -1,13 +1,17 @@
 services:
   idrive:
-    build: .
+    # Pin a version tag for unattended backups, e.g. :3.17.1-r1 (see "Which image tag to use" in the README).
     image: ghcr.io/lunksnee/idrive-docker:latest
+    # Uncomment to build locally instead of pulling from GHCR (see README for --build-arg options):
+    # build: .
     container_name: idrive
     volumes:
       - idrive:/opt/IDriveForLinux/idriveIt
       # Or a host folder instead of the named volume:
       # - /path/to/config:/opt/IDriveForLinux/idriveIt
       - /path/to/backup:/source/1:ro
+      # Writable folder to restore files into:
+      # - /path/to/restore:/restore
     restart: unless-stopped
     environment:
       - TZ=Etc/UTC
