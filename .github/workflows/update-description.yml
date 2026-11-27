@@ -11,6 +11,8 @@ jobs:
   dockerHubDescription:
     name: Update Description on DockerHub
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -24,9 +26,9 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-            echo "has_secrets=true" >> $GITHUB_OUTPUT
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_secrets=false" >> $GITHUB_OUTPUT
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
           fi
 
       # Execute the update ONLY if the boolean output is true
@@ -36,5 +38,5 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/idrive-docker
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
           short-description: ${{ github.event.repository.description }}

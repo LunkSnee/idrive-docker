@@ -27,6 +27,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TERM=xterm
 
 # Consolidate dependencies, installation, and cleanup into a single atomic layer.
+# The installer is the last command in its pipe, so its exit status already fails the build.
+# hadolint ignore=DL4006
 RUN apt-get update && \
     # 1. Install specific required packages; omitting vim and non-essentials.
     #

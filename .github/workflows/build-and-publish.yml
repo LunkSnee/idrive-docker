@@ -52,9 +52,9 @@ jobs:
         env:
           RAW_IMAGE_NAME: ${{ github.repository }}
         run: |
-          echo "IMAGE_LOWERCASE=$(echo $RAW_IMAGE_NAME | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "IMAGE_LOWERCASE=$(echo "$RAW_IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
           # Bare repo name (no owner), used for the image title label.
-          echo "REPO_NAME=${RAW_IMAGE_NAME#*/}" >> $GITHUB_ENV
+          echo "REPO_NAME=${RAW_IMAGE_NAME#*/}" >> "$GITHUB_ENV"
 
       - name: Get iDrive version
         id: version
@@ -67,9 +67,9 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-            echo "has_secrets=true" >> $GITHUB_OUTPUT
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_secrets=false" >> $GITHUB_OUTPUT
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Login to Github Packages (GHCR)
@@ -94,9 +94,9 @@ jobs:
           # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
           if docker manifest inspect "$IMAGE_REF" > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       # --- UPDATED: Only run update checkers if the image already exists ---
@@ -138,10 +138,10 @@ jobs:
 
           # $TAGS is a single comma-separated line, which build-push-action accepts
           # directly — no heredoc needed.
-          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
           # RFC 3339 timestamp for org.opencontainers.image.created
-          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       # Single source of truth for the build decision; the Build Summary below reads
       # the same outputs rather than restating the condition.
@@ -163,8 +163,8 @@ jobs:
           elif [ "$VERSION_TAG" = "not found" ]; then build=true; reason="new iDrive version"
           else reason="no updates available"
           fi
-          echo "build=$build"   >> $GITHUB_OUTPUT
-          echo "reason=$reason" >> $GITHUB_OUTPUT
+          echo "build=$build"   >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
           echo "build=$build ($reason)"
 
       - name: Build image and push
@@ -210,7 +210,7 @@ jobs:
           GHCR_REPO="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}"
           REQUESTED="${{ inputs.promote_version }}"
 
-          skip() { echo "promoted=false" >> $GITHUB_OUTPUT; echo "reason=$1" >> $GITHUB_OUTPUT; echo "$1"; exit 0; }
+          skip() { echo "promoted=false" >> "$GITHUB_OUTPUT"; echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
 
           if [ -n "$REQUESTED" ]; then
             # Explicit rollback/promotion requested by a human. Skip the age gate: the
@@ -259,8 +259,8 @@ jobs:
               --tag "$DOCKER_USER/idrive-docker:latest" "$DOCKER_USER/idrive-docker:$TARGET"
           fi
 
-          echo "promoted=true" >> $GITHUB_OUTPUT
-          echo "reason=$WHY" >> $GITHUB_OUTPUT
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
+          echo "reason=$WHY" >> "$GITHUB_OUTPUT"
           echo ":latest now points at $TARGET ($WHY)"
 
       - name: Build Summary
@@ -278,4 +278,4 @@ jobs:
             echo "**:latest promoted:** ${{ steps.promote.outputs.promoted || 'n/a' }} — ${{ steps.promote.outputs.reason || 'step did not run' }}"
             echo ""
             echo "_Version tags publish immediately; \`:latest\` waits \`LATEST_MIN_AGE_DAYS=${{ env.LATEST_MIN_AGE_DAYS }}\` days._"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"

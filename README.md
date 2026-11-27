@@ -80,3 +80,11 @@ __WARNING:__ Please take a note on your schedules, as they will be deleted in th
 ## Timezone
 Be advised, that the containers timezone is UTC and so are the backup times and the log entries. Adapt the `TZ` environment variable to your timezone to have local time in place.
 
+
+## Development
+The `Lint` workflow checks every change. Run the same checks locally (only Docker needed):
+```shell
+docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < Dockerfile
+docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh
+docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7
+```

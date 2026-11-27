@@ -1,0 +1,31 @@
+name: Lint
+
+# Fast static checks on every change, so mistakes surface before an image is built.
+# The same commands run locally (see README "Development").
+
+on:
+  push:
+    branches: [main]
+  # No branch filter, so stacked pull requests (based on another PR's branch) are checked too.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: hadolint, shellcheck, actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Dockerfile (hadolint)
+        run: docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < Dockerfile
+
+      - name: Shell scripts (shellcheck)
+        run: docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh
+
+      - name: GitHub workflows (actionlint)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -no-color
