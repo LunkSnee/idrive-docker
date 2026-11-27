@@ -91,6 +91,39 @@ __WARNING:__ Please take a note on your schedules, as they will be deleted in th
 `Configuring the same user profile with current path will terminate and delete all the existing scheduled jobs. Do you want to continue (y/n)?: y`
 - Backup content and definitions will keep, but you have to recreate your schedules.
 
+## The config volume
+`/opt/IDriveForLinux/idriveIt` holds everything IDrive keeps: the login (`cache/idriveuser.txt`),
+the schedule (`idrivecrontab.json`), and per account the settings, saved password, backup set,
+excludes and job logs (`user_profile/root/<account>/`). Mount the whole folder, as one named
+volume (as `compose.yaml` does) or a host folder; mounting only part of it loses the login or
+the schedule. Without a mount Docker uses an anonymous volume, which `docker compose down` or
+`docker rm -v` throws away; the container warns about that at start. (The `idevsutil*`
+programs in it come from the image and are refreshed at every start.)
+
+## Staying logged in across restarts and upgrades
+IDrive logs the account out when it believes the machine changed, and some of what it checks
+changes routinely in a container. At every start, before IDrive runs,
+[`docker/idrive-init.py`](docker/idrive-init.py) `prepare` fixes that up:
+
+- **Boot time:** IDrive saves the host's boot time (`UPTIME`) and logs out (`dashboard_uptime`)
+  when it differs, for example after a host reboot. The check only applies to accounts that
+  IDrive's servers have not moved to its newer WebSocket remote management (`RMWS` other than
+  `yes`; IDrive sets this at login). The current boot time is written first, so it matches.
+- **Self-update off:** IDrive's own update logs the account out afterwards and would patch the
+  container rather than the image, so it is switched off. New IDrive versions arrive as new images.
+- **Version and install markers:** the image's IDrive version is recorded as installed, IDrive's
+  "update available" marker is cleared, and its "fresh install" marker (`inst.track`) is not
+  restored on a volume that is already set up (it makes `--account-setting` treat the account
+  as new and delete its schedules).
+- **Transfer programs and stale locks:** the `idevsutil*` programs in the volume are refreshed
+  to match the image, missing default files are restored, and lock files from an unclean stop
+  are removed.
+
+`docker ps` shows `(healthy)` when IDrive's service runs and, once an account is set up, it is
+logged in, its saved-password files exist and its schedule is active. Checking only that the
+service runs is not enough: it keeps running after a logout, while backups stop. To see why it is
+unhealthy, run `docker exec idrive idrive-init.py healthcheck` (it prints nothing when healthy).
+
 ## Timezone
 Be advised, that the containers timezone is UTC and so are the backup times and the log entries. Adapt the `TZ` environment variable to your timezone to have local time in place.
 
@@ -107,5 +140,6 @@ The `Lint` workflow checks every change. Run the same checks locally (only Docke
 ```shell
 docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < Dockerfile
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh tests/*.sh
+docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.8.4 check --no-cache docker/
 docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7
 ```

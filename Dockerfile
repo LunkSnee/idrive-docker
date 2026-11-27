@@ -6,8 +6,9 @@
 #   runtime - a clean debian:trixie-slim with only what IDrive needs at run time, plus the
 #             installed /opt/IDriveForLinux copied from the builder
 #
-# docker/start.sh (the container's entry point) restores missing files from
-# idriveIt.orig.tar.gz into the persistent config volume at every start.
+# docker/start.sh (the container's entry point) runs docker/idrive-init.py at every start,
+# which restores missing files from idriveIt.orig.tar.gz into the persistent config volume.
+# .image_version records the IDrive version this image installed.
 
 # ---------------------------------------------------------------------------------------------
 # Stage 1: run IDrive's installer
@@ -74,7 +75,8 @@ RUN case "$INCLUDE_CLOUD_DRIVE" in true|false) ;; \
     fi && \
     echo "" > /opt/IDriveForLinux/idriveIt/user_profile/root/.trace/traceLog.txt && \
     tar -czf /opt/IDriveForLinux/idriveIt.orig.tar.gz -C /opt/IDriveForLinux idriveIt && \
-    /opt/IDriveForLinux/bin/idrive --version >/dev/null && \
+    /opt/IDriveForLinux/bin/idrive --version | tr -d '\r\n' > /opt/IDriveForLinux/.image_version && \
+    test -s /opt/IDriveForLinux/.image_version && \
     for bin in /opt/IDriveForLinux/idriveIt/idevsutil*; do "$bin" --help >/dev/null; done && \
     if [ -x /opt/IDriveForLinux/bin/Idrivelib/dependencies/python/dashboard ]; then \
         /opt/IDriveForLinux/bin/Idrivelib/dependencies/python/dashboard -v >/dev/null; \
@@ -104,9 +106,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Run-time packages:
 # - curl: IDrive checks for `curl` and `tar` before every backup and schedule change.
 # - net-tools: IDrive builds its device ID from the MAC address reported by `ifconfig -a`.
-# - procps: `pgrep`/`pkill`, used by start.sh and the health check.
-# - tzdata: so TZ works. nano: the editor IDrive opens for exclude lists. python3: kept from the
-#   single-stage image.
+# - procps: `pgrep`, used by the health check.
+# - tzdata: so TZ works. nano: the editor IDrive opens for exclude lists.
+# - python3: runs docker/idrive-init.py.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl python3 tzdata \
@@ -126,13 +128,16 @@ COPY --from=builder /opt/IDriveForLinux /opt/IDriveForLinux
 
 WORKDIR /opt/IDriveForLinux/bin
 
+COPY --chmod=755 docker/idrive-init.py /usr/local/bin/idrive-init.py
 COPY --chmod=755 docker/start.sh /start.sh
 
 # IDrive's settings, saved login and logs. Mount a volume or host folder here.
 VOLUME ["/opt/IDriveForLinux/idriveIt"]
 
-# Define container health check to monitor the core backup daemon
-HEALTHCHECK --interval=2m --timeout=10s --start-period=30s --retries=3 \
-    CMD pgrep -f "/etc/idrivecron" > /dev/null || exit 1
+# Healthy = IDrive's service runs and, once an account is set up, it is logged in with an
+# active schedule (see collect_health_state in docker/idrive-init.py). The check keeps its
+# own commands within 40 s, well inside the 60 s timeout.
+HEALTHCHECK --interval=2m --timeout=60s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/idrive-init.py", "healthcheck"]
 
 CMD ["/start.sh"]

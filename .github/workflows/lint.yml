@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   lint:
-    name: hadolint, shellcheck, actionlint
+    name: hadolint, shellcheck, ruff, actionlint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -26,6 +26,9 @@ jobs:
 
       - name: Shell scripts (shellcheck)
         run: docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 docker/*.sh scripts/*.sh tests/*.sh
+
+      - name: Python helper (ruff)
+        run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.8.4 check --no-cache docker/
 
       - name: GitHub workflows (actionlint)
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -no-color

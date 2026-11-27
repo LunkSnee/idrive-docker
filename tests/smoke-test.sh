@@ -68,13 +68,144 @@ pgrep -f /etc/idrivecron >/dev/null
 [ -x /opt/IDriveForLinux/idriveIt/idevsutil ]
 [ "$(cat /opt/IDriveForLinux/idriveIt/cache/version)" = "$EXPECT_VER" ]
 [ "$(date +%Z)" = EST ] || [ "$(date +%Z)" = EDT ]
+[ ! -e /opt/IDriveForLinux/idriveIt/cache/.updateVersionInfo ]
+idrive-init.py healthcheck
 ' || fail "fresh start checks"
-echo "[3] Fresh volume: service running, volume populated, TZ applied"
+echo "[3] Fresh volume: service running, volume populated, TZ applied, healthy while waiting for setup"
+if logs_contain "$c" "anonymous Docker volume"; then fail "anonymous-volume warning on a named volume"; fi
+c="${RUN_ID}-anon"
+CONTAINERS+=("$c")
+docker run -d --name "$c" "$IMAGE" >/dev/null   # nothing mounted: Docker uses an anonymous volume
+sleep 4
+logs_contain "$c" "anonymous Docker volume" || fail "no warning when the config is on an anonymous volume"
+docker rm -fv "$c" >/dev/null
+echo "[3b] Warning when the config folder is an anonymous volume, none on a named one"
+c="${RUN_ID}-fresh"
 
 # 4. docker stop is a clean stop.
 docker stop -t 10 "$c" >/dev/null
 rc=$(docker inspect --format '{{.State.ExitCode}}' "$c")
 [ "$rc" = 0 ] || fail "expected exit code 0 after docker stop, got $rc"
 echo "[4] docker stop exits 0"
+
+# Seed a volume with a set-up account, written with IDrive's own ENCRYPT, as an older image
+# would leave it: seed_account <volume> <isLoggedin> <schedule status> <extra CONFIGURATION_FILE JSON>
+seed_account() {
+    docker run --rm -i -v "$1:/opt/IDriveForLinux/idriveIt" --entrypoint bash "$IMAGE" -s "$2" "$3" "$4" <<'SEED'
+set -euo pipefail
+tar --skip-old-files -xzf /opt/IDriveForLinux/idriveIt.orig.tar.gz -C /opt/IDriveForLinux
+v=/opt/IDriveForLinux/idriveIt
+p="$v/user_profile/root/smokeuser"
+mkdir -p "$p/.userInfo" "$p/.trace"
+for f in IDPWD IDENPWD IDPWD_SCH; do printf dummy > "$p/.userInfo/$f"; done
+enc() { printf '%s' "$1" > /tmp/plain.json; /opt/IDriveForLinux/bin/idrive --utilities ENCRYPT /tmp/plain.json "$2" >/dev/null; }
+enc "{\"root\":{\"isLoggedin\":$1,\"userid\":\"smokeuser\"}}" "$v/cache/idriveuser.txt"
+enc "{\"USERNAME\":{\"VALUE\":\"smokeuser\"},\"ENCRYPTIONTYPE\":{\"VALUE\":\"DEFAULT\"},\"RMSH\":{\"VALUE\":\"x\"}$3}" "$p/CONFIGURATION_FILE"
+enc "{\"root\":{\"smokeuser\":{\"autoinstall\":{\"cmd\":\"idrive --launch-update silent\",\"settings\":{\"status\":\"enabled\"}},\"otherInfo\":{\"settings\":{\"status\":\"$2\"}}}}}" "$v/idrivecrontab.json"
+rm -f /tmp/plain.json
+SEED
+}
+
+# Decrypt one of IDrive's state files inside a container and print a Python expression of it.
+read_state() {
+    docker exec "$1" python3 -c '
+import json, subprocess, sys
+subprocess.run(["/opt/IDriveForLinux/bin/idrive", "--utilities", "DECRYPT", sys.argv[1], "/dev/shm/s.json"], check=True, capture_output=True)
+d = json.load(open("/dev/shm/s.json"))
+print(eval(sys.argv[2], {"d": d}))' "$2" "$3"
+}
+
+# 5. Upgrade: a volume as an older image leaves it (stale boot time, self-update on, IDrive's
+#    install and update markers, a lock from an unclean stop, an old version) comes out fixed.
+vol="${RUN_ID}-upg"
+c="${RUN_ID}-upg"
+docker volume create "$vol" >/dev/null
+VOLUMES+=("$vol")
+CONTAINERS+=("$c")
+seed_account "$vol" 1 ACTIVE ',"UPTIME":{"VALUE":"1999-01-01 00:00"},"AUTOSOFTWAREUPDATE":{"VALUE":1}'
+docker run --rm -v "$vol:/opt/IDriveForLinux/idriveIt" --entrypoint bash "$IMAGE" -c '
+v=/opt/IDriveForLinux/idriveIt; printf 1 > $v/inst.track; printf 3.16.0 > $v/cache/version
+printf 3.16.0 > $v/cache/.updateVersionInfo; printf 99999 > $v/user_profile/root/idrivecron.lock'
+docker run -d --name "$c" -e TZ=America/New_York -v "$vol:/opt/IDriveForLinux/idriveIt" "$IMAGE" >/dev/null
+sleep 8
+docker exec -e EXPECT_VER="$ver" "$c" bash -c '
+set -euo pipefail
+v=/opt/IDriveForLinux/idriveIt
+[ ! -e $v/inst.track ] && [ ! -e $v/cache/.updateVersionInfo ]
+[ "$(cat $v/cache/version)" = "$EXPECT_VER" ]
+[ "$(cat $v/user_profile/root/idrivecron.lock 2>/dev/null)" != 99999 ]
+idrive-init.py healthcheck
+' || fail "upgrade: markers, version, lock or health"
+cfg=/opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/CONFIGURATION_FILE
+boot=$(docker exec "$c" bash -c 'who -b | awk "{\$1=\"\"; \$2=\"\"; print \$0}" | date "+%Y-%m-%d %H:%M" -f -')
+[ "$(read_state "$c" "$cfg" 'd["UPTIME"]["VALUE"]')" = "$boot" ] || fail "upgrade: UPTIME not synced to the boot time ($boot)"
+[ "$(read_state "$c" "$cfg" 'd["AUTOSOFTWAREUPDATE"]["VALUE"]')" = 0 ] || fail "upgrade: self-update still on"
+[ "$(read_state "$c" /opt/IDriveForLinux/idriveIt/idrivecrontab.json 'd["root"]["smokeuser"]["autoinstall"]["settings"]["status"]')" = disabled ] \
+    || fail "upgrade: scheduled self-update still enabled"
+echo "[5] Upgrade: boot time synced, self-update off, markers and stale lock cleared, healthy"
+
+# 6. The health check catches a logout, a missing password file and an INACTIVE schedule.
+unhealthy_after() {  # unhealthy_after <description> <command run in the container first>
+    docker exec "$c" bash -c "$2"
+    if docker exec "$c" idrive-init.py healthcheck 2>/dev/null; then fail "health check passed despite: $1"; fi
+}
+# shellcheck disable=SC2016  # expanded inside the container, not here
+enc='enc() { printf "%s" "$1" > /tmp/p; /opt/IDriveForLinux/bin/idrive --utilities ENCRYPT /tmp/p "$2" >/dev/null; }'
+unhealthy_after "logout" "$enc; enc '{\"root\":{\"isLoggedin\":0,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
+docker exec "$c" bash -c "$enc; enc '{\"root\":{\"isLoggedin\":1,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
+docker exec "$c" idrive-init.py healthcheck || fail "health check failed after logging back in"
+unhealthy_after "missing IDPWD" "mv /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPWD /tmp/"
+docker exec "$c" mv /tmp/IDPWD /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/
+# A private-key account has two more saved files; losing one of them is unhealthy. (IDrive logged
+# out by itself while IDPWD was missing, so log back in first.)
+docker exec "$c" bash -c "$enc; enc '{\"root\":{\"isLoggedin\":1,\"userid\":\"smokeuser\"}}' /opt/IDriveForLinux/idriveIt/cache/idriveuser.txt"
+docker exec "$c" bash -c 'u=/opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo
+for f in IDPVT IDPVT_SCH; do printf dummy > "$u/$f"; done; idrive-init.py healthcheck' ||
+    fail "health check failed with private key files present"
+unhealthy_after "a missing private key file" "rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT_SCH"
+docker exec "$c" rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT
+docker exec "$c" idrive-init.py healthcheck || fail "health check failed without private key files"
+unhealthy_after "INACTIVE schedule" "$enc; enc '{\"root\":{\"smokeuser\":{\"otherInfo\":{\"settings\":{\"status\":\"INACTIVE\"}}}}}' /opt/IDriveForLinux/idriveIt/idrivecrontab.json"
+echo "[6] Health check catches a logout, missing password/private keys and an INACTIVE schedule"
+
+# 7. When IDrive hangs, the health check still ends within its budget, inside Docker's
+#    timeout, and leaves no decrypt behind (a slow check must never orphan an idrive process).
+docker exec "$c" sh -c 'cd /opt/IDriveForLinux/bin && mv idrive idrive.real &&
+    printf "#!/bin/sh\ncase \"\$*\" in *DECRYPT*) exec sleep 600;; esac\nexec /opt/IDriveForLinux/bin/idrive.real \"\$@\"\n" > idrive && chmod +x idrive'
+start=$SECONDS
+out=$(docker exec "$c" idrive-init.py healthcheck 2>&1) && fail "health check passed while IDrive hung"
+took=$((SECONDS - start))
+grep -q "IDrive busy" <<<"$out" || fail "unexpected health check output: $out"
+[ "$took" -lt 55 ] || fail "health check took ${took}s"
+if docker exec "$c" pgrep -f "sleep 600" >/dev/null; then fail "health check left a hung decrypt behind"; fi
+docker exec "$c" sh -c 'cd /opt/IDriveForLinux/bin && mv idrive.real idrive'
+docker run --rm --entrypoint python3 "$IMAGE" -c '
+import importlib.util, os, subprocess, sys, tempfile, time
+spec = importlib.util.spec_from_file_location("m", "/usr/local/bin/idrive-init.py")
+m = importlib.util.module_from_spec(spec); sys.modules["m"] = m; spec.loader.exec_module(m)
+calls = 0
+def fake_run(args, timeout=30, input_text=None):
+    global calls
+    calls += 1
+    if calls == 1:
+        raise subprocess.TimeoutExpired(args, timeout)
+    with open(args[-1], "w") as fh:
+        fh.write("{\"ok\":1}")
+    return subprocess.CompletedProcess(args, 0, "", "")
+m.run_cmd = fake_run
+m._deadline = time.monotonic() + 40
+m._timed_out = False
+with tempfile.NamedTemporaryFile(delete=False) as tf:
+    tf.write(b"cipher")
+    p = tf.name
+try:
+    data, _ = m.decrypt_json_file(p)
+    assert data == {"ok": 1} and m._timed_out is False
+finally:
+    os.unlink(p)
+' || fail "_timed_out remained sticky after successful retry"
+echo "[7] A hung IDrive makes the health check fail after ${took}s with nothing left behind"
+
+docker stop -t 10 "$c" >/dev/null
 
 echo "PASS: smoke test for $IMAGE"
