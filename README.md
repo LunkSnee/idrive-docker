@@ -187,6 +187,30 @@ logged in, its saved-password files exist and its schedule is active. Checking o
 service runs is not enough: it keeps running after a logout, while backups stop. To see why it is
 unhealthy, run `docker exec idrive idrive-init.py healthcheck` (it prints nothing when healthy).
 
+## Logs
+`docker logs idrive` shows the container's own messages (`[init]`, `[autologin]`, `[watchdog]`),
+IDrive's trace logs, and one line per finished job, for example:
+```
+[job] Backup (Scheduled) Success: 779,526 considered, 5,258 backed up (2.58 GB), 0 failed, ended 2026-11-26 02:54
+```
+While a job runs, a progress line follows every 10 minutes (the first when the job starts),
+from the counters IDrive's own progress bar uses. The percentage is by files that need an
+upload; files already in your account are counted separately:
+```
+[job] Backup (Scheduled) running since 23:30: 21,337 of 30,370 files to upload processed (70%); 777,976 of 808,346 already in the account
+```
+The times come from the job log itself, in the container's `TZ`. `IDRIVE_LOG_LEVEL` sets how
+much of IDrive's trace logs is shown:
+
+| Level | What reaches `docker logs` |
+|-------|----------------------------|
+| `full` | Everything IDrive writes to its trace logs, starting with the last 10 lines of each log as context |
+| `info` (default) | Only new lines, without IDrive's bulk output: the backup set it lists 1,000 files at a time during every backup (on a large backup set that alone is hundreds of thousands of lines), the file watcher's chatter when continuous backup (CDP) is on (`Starting/Ending rescan`, `dir add event`, bare file paths), and per-batch debug lines |
+| `summary` | Only new trace lines that report an error or a logout, and only the finished-job `[job]` lines; `docker logs` reads as a backup history |
+
+IDrive's full logs stay on the config volume (`user_profile/root/<account>/.trace/` and each
+job's log under `.../LOGS/`, also listed by `docker exec -it idrive idrive --logs`).
+
 ## Timezone
 Be advised, that the containers timezone is UTC and so are the backup times and the log entries. Adapt the `TZ` environment variable to your timezone to have local time in place.
 

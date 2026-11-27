@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Container entry point (PID 1): prepares the config volume, optionally logs in, starts
 # IDrive's own scheduler (/etc/idrivecron, which runs the backup jobs), and streams IDrive's
-# logs to `docker logs`. While running, a watchdog notices logouts (see section 5).
+# logs to `docker logs` (filtered by IDRIVE_LOG_LEVEL, plus one [job] line per finished
+# job). While running, a watchdog notices logouts (see section 5).
 # Exit codes: 0 after `docker stop`, 3 when the watchdog wants a restart to log in again,
 # otherwise non-zero when idrivecron stopped by itself.
 set -euo pipefail
@@ -29,6 +30,54 @@ if [ -n "${IDRIVE_ACCOUNT:-}${IDRIVE_ACCOUNT_FILE:-}" ] && [ -n "${IDRIVE_PASSWO
 fi
 # Keep plain-text credentials out of the environment of IDrive's processes (/proc/*/environ).
 unset IDRIVE_ACCOUNT IDRIVE_PASSWORD IDRIVE_ENCRYPTION_KEY IDRIVE_TOTP_SECRET
+
+# How much of IDrive's own trace logs reaches `docker logs` (the container's messages always do):
+#   full    - everything, starting with the last 10 lines already in each log as context
+#   info    - only new lines, without IDrive's bulk output: the file watcher's chatter
+#             (rescans, "dir add event", bare file paths), the backup set it lists 1,000
+#             files at a time during every backup, and its per-batch debug lines
+#   summary - only new lines that report an error or a logout; finished jobs still get
+#             their [job] line
+# (The base daemon log can go unwritten for months, so replaying its last lines at start
+# shows old messages as if they were new; only full does that.)
+LOG_LEVEL="${IDRIVE_LOG_LEVEL:-info}"
+case "$LOG_LEVEL" in
+    full|info|summary) ;;
+    *) echo "ERROR: IDRIVE_LOG_LEVEL must be full, info or summary" >&2; exit 1 ;;
+esac
+
+# A trace line is "[date time][user][module][Line: N] message"; a message can continue over
+# further lines without that prefix (the backup set listing does, one file per line), and
+# those lines follow the fate of their message. mawk (Debian's awk) because grep cannot keep that
+# state; -W interactive makes it handle each line as it arrives instead of in large blocks.
+# Patterns avoid backslashes, which awk -v would reinterpret.
+# shellcheck disable=SC2016  # an awk program: $0 is awk's, not the shell's
+LOG_FILTER='
+/^[[][0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9] [0-9:]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]]/ {
+    msg = $0
+    sub(/^[[][^]]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]] ?/, "", msg)
+    if (mode == "info") keep = (msg !~ bulk && !(msg ~ /^[/]/ && tolower(msg) !~ errors))
+    else keep = (tolower(msg) ~ errors && msg !~ benign)
+}
+keep { print; fflush() }'
+# info drops these messages (with their continuation lines), plus bare file paths that report no
+# error (IDrive's file watcher logs each changed path on its own, tagged [&utilities]):
+LOG_BULK='^(Starting rescan|Ending rescan|dir add event, trigger scan|line no [0-9]+ backupset contents : .*|POSIX FORK TRACKERS: .*|line [0-9]+ [0-9]+)$'
+# summary keeps messages with one of these words (whole words: not "failedFilescount")...
+LOG_ERRORS='(^|[^a-z])(errors?|failed|failure|invalid|denied|logout|logged out|mismatch|blocked|expired|timed out|timeout|unable to|cannot)([^a-z]|$)'
+# ...except this one, which IDrive logs after every job when there were no errors to collect.
+LOG_BENIGN='unable to open file : .*/error[.]txt'
+
+# follow_log <file>: stream one of IDrive's trace logs to docker logs at LOG_LEVEL. In info and
+# summary, tail's own notices (IDrive rotates its logs often) are dropped as well.
+follow_log() {
+    case "$LOG_LEVEL" in
+        full) tail -F "$1" ;;
+        info) tail -n 0 -F "$1" 2>/dev/null | mawk -W interactive -v mode=info -v keep=1 -v bulk="$LOG_BULK" -v errors="$LOG_ERRORS" "$LOG_FILTER" ;;
+        summary) tail -n 0 -F "$1" 2>/dev/null |
+            mawk -W interactive -v mode=summary -v keep=0 -v errors="$LOG_ERRORS" -v benign="$LOG_BENIGN" "$LOG_FILTER" ;;
+    esac
+}
 
 # Seconds between watchdog checks (docker/idrive-init.py, cmd_watchdog); 0 turns it off.
 WATCHDOG_INTERVAL="${IDRIVE_WATCHDOG_INTERVAL:-300}"
@@ -89,8 +138,9 @@ cron_pid=$!
 BASE_LOG_DIR="/opt/IDriveForLinux/idriveIt/user_profile/root/.trace"
 BASE_LOG="${BASE_LOG_DIR}/traceLog.txt"
 
-echo "Tailing base daemon log: $BASE_LOG"
-tail -F "$BASE_LOG" &
+echo "Tailing base daemon log: $BASE_LOG (IDRIVE_LOG_LEVEL=$LOG_LEVEL)"
+follow_log "$BASE_LOG" &
+tail_base_pid=$!
 
 # 5. Supervise idrivecron until it stops: tail the account's log once it exists, and run the
 #    session watchdog every WATCHDOG_INTERVAL seconds. idrivecron replaces itself with a new
@@ -102,6 +152,7 @@ tail -F "$BASE_LOG" &
 echo "Polling for authenticated user log generation..."
 user_log_tailed=0
 next_watchdog=$((SECONDS + WATCHDOG_INTERVAL))
+next_job_summary=$SECONDS
 cron_missing=0
 
 while [ "$cron_missing" -lt 6 ]; do
@@ -112,9 +163,16 @@ while [ "$cron_missing" -lt 6 ]; do
         user_log=$(find /opt/IDriveForLinux/idriveIt/user_profile/root -mindepth 3 -type f -name "traceLog.txt" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)
         if [ -n "$user_log" ]; then
             echo "Tailing authenticated user log: $user_log"
-            tail -F "$user_log" &
+            follow_log "$user_log" &
+            tail_user_pid=$!
             user_log_tailed=1
         fi
+    fi
+
+    # One [job] line per finished backup/restore (docker/idrive-init.py, cmd_job_summaries).
+    if [ "$SECONDS" -ge "$next_job_summary" ]; then
+        next_job_summary=$((SECONDS + 30))
+        /usr/local/bin/idrive-init.py job-summaries || true
     fi
 
     if [ "$WATCHDOG_INTERVAL" -gt 0 ] && [ "$SECONDS" -ge "$next_watchdog" ]; then

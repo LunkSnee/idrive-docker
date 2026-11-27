@@ -14,6 +14,8 @@ Commands:
   watchdog     run by start.sh every IDRIVE_WATCHDOG_INTERVAL seconds: asks for a restart
                (exit 3) when a logout needs automated login again (see cmd_watchdog)
   reset-login  clear the automated-login backoff/pause (see cmd_reset_login)
+  job-summaries  run by start.sh every 30 s: one log line per finished backup/restore job, and
+               a progress line every 10 minutes while one runs (see cmd_job_summaries)
 
 IDrive keeps most of its state as JSON scrambled with its own encryption; the helper reads
 and writes it with IDrive's own `idrive --utilities DECRYPT|ENCRYPT`, so the format stays
@@ -1407,6 +1409,220 @@ def cmd_reset_login() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------------------------
+# job-summaries: one line per finished job in `docker logs`
+# ---------------------------------------------------------------------------------------------
+# Each job writes a log under user_profile/root/<account>/<Type>/<Set>/LOGS/ named
+# <start epoch>_<Success|Failure|...|Running>_<Manual|Scheduled>, ending in a [SUMMARY:] block.
+JOB_LOGS_GLOB = os.path.join(PROFILE_ROOT, "*", "*", "*", "LOGS", "*")
+# Which job logs were already reported. Kept in the container (not the volume): after a
+# restart only jobs that finish from then on are reported.
+JOB_SUMMARY_STATE = "/tmp/idrive-job-summaries.json"
+# While a job runs, IDrive keeps in the job's folder (Backup/DefaultBackupSet/ etc.):
+#   pid.txt              the job's process ID (IDrive locks the file while the job runs)
+#   info_file            "TOTALFILES <n>" and "READYSYNC <n>" (files already in the account,
+#                        which need no upload)
+#   PROGRESS_DETAILS_<n> per upload engine, one value per line; [8] = files it has processed
+# IDrive's own progress bar adds them up the same way (displayProgressBar). Its byte
+# percentage is not used: the byte total includes files that turn out to be in the account
+# already, so it stops well short of 100% on an incremental backup.
+PROGRESS_INTERVAL_S = 10 * 60
+
+
+def job_process_alive(set_dir: str) -> bool:
+    """True while the job's process from pid.txt is running. (Never take IDrive's lock on
+    pid.txt to find out: a held lock makes IDrive skip its own job as already running.)"""
+    try:
+        with open(os.path.join(set_dir, "pid.txt"), encoding="utf-8", errors="replace") as fh:
+            pids = re.findall(r"\d+", fh.read())
+    except OSError:
+        return False
+    if not pids:
+        return False
+    pid = pids[-1]
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+        rparen = stat.rfind(")")
+        if rparen != -1 and stat[rparen + 2 : rparen + 3] in ("Z", "X"):
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip().lower()
+    except OSError:
+        return False
+    return any(tok in cmdline for tok in ("idrive", "idevsutil", "dashboard"))
+
+
+def job_progress_line(running_log: str) -> str:
+    """'Backup (Manual) running since 09:35: 21,337 of 30,370 files to upload processed (70%)'"""
+    set_dir = os.path.dirname(os.path.dirname(running_log))
+    parts = os.path.basename(running_log).split("_")
+    kind = parts[2] if len(parts) > 2 else ""
+    job_type = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", os.path.basename(os.path.dirname(set_dir)))
+    since = time.strftime("%H:%M", time.localtime(int(parts[0]))) if parts[0].isdigit() else "?"
+    label = f"{job_type} ({kind})" if kind else job_type
+    info: dict[str, int] = {}
+    try:
+        with open(os.path.join(set_dir, "info_file"), encoding="utf-8", errors="replace") as fh:
+            for key, value in re.findall(r"^(TOTALFILES|READYSYNC) (\d+)", fh.read(), re.M):
+                info[key] = int(value)
+    except OSError:
+        pass
+    if "TOTALFILES" not in info:
+        return f"{label} running since {since}: preparing the file list"
+    to_upload = max(info["TOTALFILES"] - info.get("READYSYNC", 0), 0)
+    done = 0
+    for path in glob.glob(os.path.join(set_dir, "PROGRESS_DETAILS_*")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                v = [x.strip() for x in fh.read().split("\n")]
+        except OSError:
+            continue
+        if len(v) >= 9 and v[8].isdigit():
+            done += int(v[8])
+    pct = min(100, done * 100 // to_upload) if to_upload else 100
+    return (
+        f"{label} running since {since}: {min(done, to_upload):,} of {to_upload:,} files to upload processed ({pct}%); "
+        f"{info.get('READYSYNC', 0):,} of {info['TOTALFILES']:,} already in the account"
+    )
+
+
+def summarize_job_log(path: str) -> str:
+    """'Backup (Scheduled) Success: 779,526 considered, 5,258 backed up (2.58 GB), 0 failed, ended 2026-11-26 02:54'
+
+    IDrive sometimes reports an impossible (negative) failed count, and then calls the job a
+    Failure because the count is not 0; that is shown as such, with the files that went missing
+    during the job (moved or deleted before IDrive read them), which IDrive lists separately."""
+    parts = os.path.basename(path).split("_")
+    status = parts[1] if len(parts) > 1 else "Finished"
+    kind = parts[2] if len(parts) > 2 else ""
+    job_type = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))  # Backup, Restore, ...
+    job_type = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", job_type)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    summary = text[max(text.find("[SUMMARY"), 0):]
+
+    def num(pattern: str) -> str | None:
+        m = re.search(pattern, summary, re.M)
+        return f"{int(m.group(1).replace(',', '')):,}" if m else None
+
+    considered = num(r"^Files considered for [^:\n]+\s*:\s*([\d,]+)")
+    done_m = re.search(r"^Files (\w+(?: \w+)?) now\s*:\s*([\d,]+)(?:.*?\[Size of [^:\]]*:\s*([^\]]+)\])?", summary, re.M)
+    failed_m = re.search(r"^Files failed to [^:\n]+\s*:\s*(-?[\d,]+)", summary, re.M)
+    failed = int(failed_m.group(1).replace(",", "")) if failed_m else None
+    missing_m = re.search(r"Total number of file\(s\) Missing\s*:\s*([\d,]+)", text)
+    end_m = re.search(r"^[A-Za-z][A-Za-z ]* End Time\s*:\s*(.+?)\s*$", summary, re.M)
+    try:
+        ended = time.strftime("%Y-%m-%d %H:%M", time.strptime(end_m.group(1), "%a %b %d %H:%M:%S %Y")) if end_m else None
+    except ValueError:
+        ended = end_m.group(1)
+    if ended is None and parts[0].isdigit():  # no end time logged: fall back to the start time
+        ended = "started " + time.strftime("%Y-%m-%d %H:%M", time.localtime(int(parts[0])))
+    elif ended is not None:
+        ended = "ended " + ended
+
+    details = []
+    if considered is not None:
+        details.append(f"{considered} considered")
+    if done_m:
+        size = f" ({done_m.group(3).strip()})" if done_m.group(3) else ""
+        details.append(f"{int(done_m.group(2).replace(',', '')):,} {done_m.group(1)}{size}")
+    if missing_m:
+        details.append(f"{int(missing_m.group(1).replace(',', '')):,} missing")
+    if failed is not None:
+        details.append(f"{failed:,} failed" if failed >= 0 else f"invalid failed count from IDrive ({failed:,})")
+    if ended:
+        details.append(ended)
+    label = f"{job_type} ({kind})" if kind else job_type
+    return f"{label} {status}" + (": " + ", ".join(details) if details else "")
+
+
+def cmd_job_summaries() -> int:
+    """Print one line per job log that finished since the last call (and since container start),
+    and a progress line for each running job every PROGRESS_INTERVAL_S (not at IDRIVE_LOG_LEVEL=summary)."""
+    try:
+        with open(JOB_SUMMARY_STATE, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {"since": time.time(), "reported": {}}  # first call: report only jobs from now on
+    if not isinstance(state, dict):
+        state = {"since": time.time(), "reported": {}}
+    since = float(state.get("since", time.time()))
+    raw_reported = state.get("reported", {})
+    if isinstance(raw_reported, dict):
+        reported: dict[str, float] = {str(k): float(v) for k, v in raw_reported.items()}
+    elif isinstance(raw_reported, list):
+        reported = {str(p): since for p in raw_reported}
+    else:
+        reported = {}
+
+    finished: list[tuple[float, str]] = []
+    running_logs: list[str] = []
+    for path in glob.glob(JOB_LOGS_GLOB):
+        name = os.path.basename(path)
+        if "_Running_" in name:
+            running_logs.append(path)
+            continue
+        if path in reported:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime >= since:
+            finished.append((mtime, path))
+
+    for mtime, path in sorted(finished):
+        try:
+            print(f"[job] {summarize_job_log(path)}")
+        except OSError:
+            continue
+        reported[path] = mtime
+
+    if len(reported) > 500:
+        ordered = sorted(reported.items(), key=lambda kv: (kv[1], kv[0]))
+        cutoff = max(since, ordered[-500][1])
+        since = cutoff
+        reported = {p: m for p, m in ordered if m >= cutoff}
+    state["since"] = since
+    state["reported"] = reported
+
+    # Progress: per job folder only the newest _Running_ log, and only while its process runs
+    # (IDrive can leave a _Running_ log behind, for example from a scheduled start that found
+    # another job running). An unchanged line is not repeated.
+    raw_progress = state.get("progress", {})
+    progress: dict[str, dict[str, Any]] = raw_progress if isinstance(raw_progress, dict) else {}
+    if os.environ.get("IDRIVE_LOG_LEVEL", "info").strip().lower() != "summary":
+        now_mono = time.monotonic()
+        newest: dict[str, str] = {}
+        for path in running_logs:
+            set_dir = os.path.dirname(os.path.dirname(path))
+            if os.path.basename(path) > os.path.basename(newest.get(set_dir, "")):
+                newest[set_dir] = path
+        active = [p for d, p in newest.items() if job_process_alive(d)]
+        for path in active:
+            last = progress.get(path)
+            if not isinstance(last, dict) or "at" not in last:
+                due = True
+            else:
+                last_at = float(last["at"])
+                due = last_at > now_mono or now_mono - last_at >= PROGRESS_INTERVAL_S
+            if due:
+                line = job_progress_line(path)
+                if not isinstance(last, dict) or line != last.get("line"):
+                    print(f"[job] {line}")
+                progress[path] = {"at": now_mono, "line": line}
+        progress = {p: v for p, v in progress.items() if p in active}
+    state["progress"] = progress
+
+    state_dir = os.path.dirname(JOB_SUMMARY_STATE) or "/tmp"
+    fd, tmp_path = tempfile.mkstemp(prefix=".idrive-job-summaries.", dir=state_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp_path, JOB_SUMMARY_STATE)
+    return 0
+
+
 def main() -> int:
     # Keep stdout and stderr lines in order in `docker logs` (stdout is block-buffered when piped).
     sys.stdout.reconfigure(line_buffering=True)
@@ -1416,6 +1632,7 @@ def main() -> int:
         "healthcheck": cmd_healthcheck,
         "watchdog": cmd_watchdog,
         "reset-login": cmd_reset_login,
+        "job-summaries": cmd_job_summaries,
     }
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(f"Usage: idrive-init.py {{{'|'.join(commands)}}}", file=sys.stderr)
