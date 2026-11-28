@@ -68,12 +68,17 @@ LOG_FILTER='
 /^[[][0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9] [0-9:]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]]/ {
     msg = $0
     sub(/^[[][^]]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]] ?/, "", msg)
-    if (mode == "info") keep = (msg !~ bulk && !(msg ~ /^[/]/ && tolower(msg) !~ errors))
-    else keep = (tolower(msg) ~ errors && msg !~ benign)
+    # A bare file path reports an error only after it ("/x/a.db: Permission denied"), so look
+    # for error words there, not in the path itself (IDrive has a folder named ERROR).
+    path = (msg ~ /^[/]/)
+    text = msg
+    if (path) text = match(msg, /: /) ? substr(msg, RSTART + 2) : ""
+    if (mode == "info") keep = (msg !~ bulk && (!path || tolower(text) ~ errors))
+    else keep = (tolower(text) ~ errors && msg !~ benign)
 }
 keep { print; fflush() }'
 # info drops these messages (with their continuation lines), plus bare file paths that report no
-# error (IDrive's file watcher logs each changed path on its own, tagged [&utilities]):
+# error after the path (IDrive's file watcher logs each changed path on its own, tagged [&utilities]):
 LOG_BULK='^(Starting rescan|Ending rescan|dir add event, trigger scan|line no [0-9]+ backupset contents : .*|POSIX FORK TRACKERS: .*|line [0-9]+ [0-9]+)$'
 # summary keeps messages with one of these words (whole words: not "failedFilescount")...
 LOG_ERRORS='(^|[^a-z])(errors?|failed|failure|invalid|denied|logout|logged out|mismatch|blocked|expired|timed out|timeout|unable to|cannot)([^a-z]|$)'

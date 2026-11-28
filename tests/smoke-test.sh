@@ -443,6 +443,7 @@ trace_lines='[2026/11/26 02:10:01][root][&backup][Line: 1] Prepare file list...
 [2026/11/26 02:10:01][root][&utilities][Line: 1] Starting rescan
 [2026/11/26 02:10:01][root][&utilities][Line: 1] dir add event, trigger scan
 [2026/11/26 02:10:01][root][&utilities][Line: 1] /source/1/photo.jpg
+[2026/11/26 02:10:01][root][&utilities][Line: 1] /source/1/job/ERROR
 [2026/11/26 02:10:01][root][Header.pl][Line: 1] line no 1043 backupset contents : /source/1/a.txt
 /source/1/listed-file.txt
 [2026/11/26 02:10:01][root][&backup][Line: 1] POSIX FORK TRACKERS: EVS Child PID: 4711
@@ -468,13 +469,13 @@ for level in full info summary; do
     sleep 2
     logs=$(docker logs "$c" 2>&1)
     seen=""
-    for msg in "old error" "Prepare file list" "Starting rescan" "dir add event" "photo.jpg" "backupset contents" \
+    for msg in "old error" "Prepare file list" "Starting rescan" "dir add event" "photo.jpg" "job/ERROR" "backupset contents" \
                "listed-file.txt" "POSIX FORK" "line 1072" "failedFilescount" "Permission denied" "password mismatch" \
                "timed out" "unable to open file" "normal logout"; do
         grep -q -- "$msg" <<<"$logs" && seen="$seen${seen:+,}$msg"
     done
     case "$level" in
-        full) want="old error,Prepare file list,Starting rescan,dir add event,photo.jpg,backupset contents,listed-file.txt,POSIX FORK,line 1072,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
+        full) want="old error,Prepare file list,Starting rescan,dir add event,photo.jpg,job/ERROR,backupset contents,listed-file.txt,POSIX FORK,line 1072,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
         info) want="Prepare file list,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
         summary) want="Permission denied,password mismatch,timed out,normal logout" ;;
     esac
