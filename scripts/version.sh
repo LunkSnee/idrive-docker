@@ -4,10 +4,12 @@ set -eo pipefail
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 VERSION_URL="https://www.idrivedownloads.com/downloads/linux/download-for-linux/version-linux.js"
 
-# Extract the script version and its (cache-busted) download URL. curl -f makes an
-# unreachable or erroring endpoint fail here, with curl's own diagnostic, rather than
-# surfacing later as a confusing "not found".
-RAW=$(curl -fsSL "$VERSION_URL")
+# Extract the script version and its (cache-busted) download URL. idrive-fetch.sh retries when
+# IDrive's server answers with something else, and reports what came back.
+RAW_FILE=$(mktemp)
+trap 'rm -f "$RAW_FILE"' EXIT
+"$(dirname "$0")/idrive-fetch.sh" "$VERSION_URL" "$RAW_FILE" linuxScriptVersion
+RAW=$(cat "$RAW_FILE")
 VERSION=$(echo "$RAW" | grep -oP 'var\s+linuxScriptVersion\s*=\s*"Version\s+\K[0-9.]+(?=")' || true)
 URL=$(echo "$RAW" | grep -oP "var\s+linuxScriptPackageURL\s*=\s*'\K[^']+(?=')" || true)
 

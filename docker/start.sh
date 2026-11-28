@@ -9,6 +9,18 @@ set -euo pipefail
 
 echo "Initializing IDrive container..."
 
+# 0. Time zone for every process. IDrive starts its continuous-backup services (file watcher,
+#    database writer, CDP client and server) without the container's TZ, so they fall back to
+#    /etc/localtime, which is UTC in the image; point it at TZ so their log lines use local time.
+if [ -n "${TZ:-}" ]; then
+    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+        echo "$TZ" > /etc/timezone
+    else
+        echo "WARNING: unknown time zone TZ=$TZ; IDrive's services use UTC." >&2
+    fi
+fi
+
 # 1. Bring the persistent volume in line with this image before IDrive starts: restore
 #    missing defaults, refresh the idevsutil programs, record the IDrive version, and fix the
 #    state that would otherwise make IDrive log out (see docker/idrive-init.py, cmd_prepare).
@@ -56,12 +68,17 @@ LOG_FILTER='
 /^[[][0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9] [0-9:]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]]/ {
     msg = $0
     sub(/^[[][^]]*[]][[][^]]*[]][[][^]]*[]][[]Line: [0-9]+[]] ?/, "", msg)
-    if (mode == "info") keep = (msg !~ bulk && !(msg ~ /^[/]/ && tolower(msg) !~ errors))
-    else keep = (tolower(msg) ~ errors && msg !~ benign)
+    # A bare file path reports an error only after it ("/x/a.db: Permission denied"), so look
+    # for error words there, not in the path itself (IDrive has a folder named ERROR).
+    path = (msg ~ /^[/]/)
+    text = msg
+    if (path) text = match(msg, /: /) ? substr(msg, RSTART + 2) : ""
+    if (mode == "info") keep = (msg !~ bulk && (!path || tolower(text) ~ errors))
+    else keep = (tolower(text) ~ errors && msg !~ benign)
 }
 keep { print; fflush() }'
 # info drops these messages (with their continuation lines), plus bare file paths that report no
-# error (IDrive's file watcher logs each changed path on its own, tagged [&utilities]):
+# error after the path (IDrive's file watcher logs each changed path on its own, tagged [&utilities]):
 LOG_BULK='^(Starting rescan|Ending rescan|dir add event, trigger scan|line no [0-9]+ backupset contents : .*|POSIX FORK TRACKERS: .*|line [0-9]+ [0-9]+)$'
 # summary keeps messages with one of these words (whole words: not "failedFilescount")...
 LOG_ERRORS='(^|[^a-z])(errors?|failed|failure|invalid|denied|logout|logged out|mismatch|blocked|expired|timed out|timeout|unable to|cannot)([^a-z]|$)'

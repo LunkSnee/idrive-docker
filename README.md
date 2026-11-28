@@ -9,7 +9,7 @@ On top of the plain IDrive client, this image:
 - **Stays logged in across restarts, host reboots and image upgrades.** IDrive logs itself out when it thinks the machine changed; the container updates the state IDrive checks before it starts.
 - **Can log in by itself** (optional): first-time setup and re-login from Docker secrets, including two-factor authentication (2FA) codes from an authenticator-app setup key.
 - **Recovers from logouts while running**: a watchdog notices and restarts the container to log in again, with backoff so it can never lock your account.
-- **Reports real health** in `docker ps`: `(healthy)` means IDrive's service is running *and* (once configured or with credentials provided) logged in with an active schedule.
+- **Reports real health** in `docker ps`: `(healthy)` means IDrive's service is running *and* (once configured or with credentials provided) logged in with an active schedule whose last 3 scheduled backups did not all fail.
 - **Keeps `docker logs` readable**: filters out IDrive's bulk file-list chatter by default and adds concise `[job]` summary and progress lines.
 - **Updates IDrive through new images**, not by patching itself inside the container (which would log you out).
 
@@ -200,6 +200,9 @@ docker compose pull && docker compose up -d
 | Symptom | What to do |
 |---------|------------|
 | `docker ps` shows `(unhealthy)` | Run `docker exec idrive idrive-init.py healthcheck` for the exact reason (prints nothing when healthy). |
+| `the last 3 scheduled backups failed` | Backups have stopped working while IDrive is logged in (for example a source folder no longer mounted, a full quota, or a changed encryption key). The `[job]` lines in `docker logs` and `docker exec -it idrive idrive --logs` show why; the container is healthy again after the next successful scheduled backup. |
+| Log or schedule times are hours off | Check `tz=` and `local_time=` in the `[init] Summary:` line. With `TZ=${TZ}` under `environment:` in your compose file, a `TZ` set in the shell or deploy tool that runs Compose overrides `.env`; this image's `compose.yaml` loads `.env` with `env_file:`, which is not affected. |
+| Excluded files are still backed up | IDrive applies exclude lists changed in its editor once it refreshes its file database. In `docker exec -it idrive idrive --edit-job-sets`, switch the hidden-files exclusion off and on again to make it refresh. |
 | `WARNING: IDrive's config (...) is on an anonymous Docker volume` | Mount a named volume (`idrive:/opt/IDriveForLinux/idriveIt`) or host bind mount so `docker compose down` does not erase your login and schedule. |
 | `RMSH is empty in CONFIGURATION_FILE` | Logins created by older IDrive releases lack `RMSH`, which IDrive `3.17.1+` validates; run `docker exec -it idrive idrive --login` once. |
 | Log says `automated login paused after: ...` | Fix the password, 2FA key, or setting and restart, or run `docker exec idrive idrive-init.py reset-login && docker restart idrive`. |
@@ -221,7 +224,7 @@ At every container start, [`docker/start.sh`](docker/start.sh) runs [`docker/idr
 - **Version and install markers:** `cache/version` is synced to the image's IDrive version, `cache/.updateVersionInfo` is removed, and `inst.track` is excluded/removed once an account is initialized (leaving `inst.track` causes `--account-setting` to wipe schedules).
 - **Transfer helpers and locks:** missing defaults are restored from `/opt/IDriveForLinux/idriveIt.orig.tar.gz`, `idevsutil*` binaries are refreshed to match the image, and stale `.lock`/`.pid` files from unclean stops are removed.
 
-The image is built in two stages on `debian:trixie-slim`: stage 1 runs the IDrive installer (using a build-only `crontab` stub, since IDrive runs `/etc/idrivecron`) and packs defaults into `idriveIt.orig.tar.gz`; stage 2 copies only the runtime installation and drops build tools, `cron`/`systemd`, `locales` (`C.UTF-8` is built into Debian), `unzip`, and by default Cloud Drive (`INCLUDE_CLOUD_DRIVE=false`; note that setting `INCLUDE_CLOUD_DRIVE=true` preserves IDrive's Cloud Drive files, though FUSE host packages such as `fuse3` are not installed in the lean runtime stage).
+The image is built in a single stage on `debian:trixie-slim`. It installs only runtime packages, satisfies the IDrive installer with a temporary `crontab` stub removed in the same layer (avoiding `cron` and `systemd`, since IDrive runs `/etc/idrivecron`), omits `locales` (`C.UTF-8` is built into Debian) and `unzip`, packs the default configuration into `idriveIt.orig.tar.gz`, and strips installer caches, non-Debian cron scripts, and by default Cloud Drive (`INCLUDE_CLOUD_DRIVE=false`; note that setting `INCLUDE_CLOUD_DRIVE=true` preserves IDrive's Cloud Drive files, though FUSE host packages such as `fuse3` are not installed in the lean image).
 
 ## Development
 

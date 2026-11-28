@@ -23,6 +23,9 @@ idriveIt/
 .DS_Store
 Thumbs.db
 
+# IDrive installer downloaded by the Build and Publish workflow
+.installer/
+
 # Python bytecode
 __pycache__/
 *.py[cod]

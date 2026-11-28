@@ -68,11 +68,13 @@ pgrep -f /etc/idrivecron >/dev/null
 [ -x /opt/IDriveForLinux/idriveIt/idevsutil ]
 [ "$(cat /opt/IDriveForLinux/idriveIt/cache/version)" = "$EXPECT_VER" ]
 [ "$(date +%Z)" = EST ] || [ "$(date +%Z)" = EDT ]
+tz=$(env -u TZ date +%Z); [ "$tz" = EST ] || [ "$tz" = EDT ]   # processes started without TZ
 [ ! -e /opt/IDriveForLinux/idriveIt/cache/.updateVersionInfo ]
 idrive-init.py healthcheck
 ' || fail "fresh start checks"
-echo "[3] Fresh volume: service running, volume populated, TZ applied, healthy while waiting for setup"
+echo "[3] Fresh volume: service running, volume populated, TZ applied (also without TZ), healthy while waiting for setup"
 if logs_contain "$c" "anonymous Docker volume"; then fail "anonymous-volume warning on a named volume"; fi
+logs_contain "$c" "tz=America/New_York local_time=" || fail "the [init] Summary line does not show the time zone"
 c="${RUN_ID}-anon"
 CONTAINERS+=("$c")
 docker run -d --name "$c" "$IMAGE" >/dev/null   # nothing mounted: Docker uses an anonymous volume
@@ -168,8 +170,25 @@ for f in IDPVT IDPVT_SCH; do printf dummy > "$u/$f"; done; idrive-init.py health
 unhealthy_after "a missing private key file" "rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT_SCH"
 docker exec "$c" rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT
 docker exec "$c" idrive-init.py healthcheck || fail "health check failed without private key files"
+# Three finished scheduled backups that failed in a row make it unhealthy. Manual jobs, IDrive's
+# negative failed count on a backup that worked, and a newer success do not.
+docker exec "$c" bash -c '
+set -euo pipefail
+l=/opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/Backup/DefaultBackupSet/LOGS
+mkdir -p "$l"
+job() { printf "[SUMMARY:]\nFiles considered for backup : 10\nFiles backed up now : 0\nFiles failed to backup : %s\n" "$3" > "$l/$1_$2"; }
+job 1795000001 Failure_Scheduled 5; job 1795000002 Failure_Scheduled 5; job 1795000003 Failure_Manual 5
+job 1795000004 Failure_Scheduled -2; job 1795000005 Failure_Scheduled 5; job 1795000006 Running_Scheduled 0
+idrive-init.py healthcheck                          # newest three: 05, 04 (negative count: it worked), 02
+job 1795000007 Failure_Scheduled 5; job 1795000008 Failure_Scheduled 5
+out=$(idrive-init.py healthcheck 2>&1) && exit 1
+grep -q "last 3 scheduled backups failed (newest: 1795000008_Failure_Scheduled)" <<<"$out"
+job 1795000009 Success_Scheduled 0
+idrive-init.py healthcheck
+rm -rf "$l"
+' || fail "health check and failed scheduled backups"
 unhealthy_after "INACTIVE schedule" "$enc; enc '{\"root\":{\"smokeuser\":{\"otherInfo\":{\"settings\":{\"status\":\"INACTIVE\"}}}}}' /opt/IDriveForLinux/idriveIt/idrivecrontab.json"
-echo "[6] Health check catches a logout, missing password/private keys and an INACTIVE schedule"
+echo "[6] Health check catches a logout, missing password/private keys, failing backups and an INACTIVE schedule"
 
 # 7. When IDrive hangs, the health check still ends within its budget, inside Docker's
 #    timeout, and leaves no decrypt behind (a slow check must never orphan an idrive process).
@@ -442,6 +461,7 @@ trace_lines='[2026/11/26 02:10:01][root][&backup][Line: 1] Prepare file list...
 [2026/11/26 02:10:01][root][&utilities][Line: 1] Starting rescan
 [2026/11/26 02:10:01][root][&utilities][Line: 1] dir add event, trigger scan
 [2026/11/26 02:10:01][root][&utilities][Line: 1] /source/1/photo.jpg
+[2026/11/26 02:10:01][root][&utilities][Line: 1] /source/1/job/ERROR
 [2026/11/26 02:10:01][root][Header.pl][Line: 1] line no 1043 backupset contents : /source/1/a.txt
 /source/1/listed-file.txt
 [2026/11/26 02:10:01][root][&backup][Line: 1] POSIX FORK TRACKERS: EVS Child PID: 4711
@@ -467,13 +487,13 @@ for level in full info summary; do
     sleep 2
     logs=$(docker logs "$c" 2>&1)
     seen=""
-    for msg in "old error" "Prepare file list" "Starting rescan" "dir add event" "photo.jpg" "backupset contents" \
+    for msg in "old error" "Prepare file list" "Starting rescan" "dir add event" "photo.jpg" "job/ERROR" "backupset contents" \
                "listed-file.txt" "POSIX FORK" "line 1072" "failedFilescount" "Permission denied" "password mismatch" \
                "timed out" "unable to open file" "normal logout"; do
         grep -q -- "$msg" <<<"$logs" && seen="$seen${seen:+,}$msg"
     done
     case "$level" in
-        full) want="old error,Prepare file list,Starting rescan,dir add event,photo.jpg,backupset contents,listed-file.txt,POSIX FORK,line 1072,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
+        full) want="old error,Prepare file list,Starting rescan,dir add event,photo.jpg,job/ERROR,backupset contents,listed-file.txt,POSIX FORK,line 1072,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
         info) want="Prepare file list,failedFilescount,Permission denied,password mismatch,timed out,unable to open file,normal logout" ;;
         summary) want="Permission denied,password mismatch,timed out,normal logout" ;;
     esac
