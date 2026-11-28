@@ -61,11 +61,11 @@ ARG INCLUDE_CLOUD_DRIVE=false
 #   (/etc/idrivecron), so a temporary stub satisfies the check without installing cron and
 #   systemd and is removed in the same layer.
 # - The installer comes from the "installer" build context when given, otherwise from IDRIVE_URL
-#   via scripts/fetch-installer.sh, which retries when IDrive's link answers with a web page.
+#   via scripts/idrive-fetch.sh, which retries when IDrive's link answers with a web page.
 # - printf, not `echo -en`: RUN uses dash, whose echo prints -en literally. The installer is the
 #   last command in its pipe, so its exit status already fails the build.
 # hadolint ignore=DL4006
-RUN --mount=type=bind,source=scripts/fetch-installer.sh,target=/fetch-installer.sh \
+RUN --mount=type=bind,source=scripts/idrive-fetch.sh,target=/idrive-fetch.sh \
     --mount=type=bind,from=installer,target=/installer \
     case "$INCLUDE_CLOUD_DRIVE" in true|false) ;; \
         *) echo "INCLUDE_CLOUD_DRIVE must be true or false" >&2; exit 1 ;; esac && \
@@ -75,7 +75,7 @@ RUN --mount=type=bind,source=scripts/fetch-installer.sh,target=/fetch-installer.
         echo "Using the given IDrive installer." && \
         cp /installer/idriveforlinux.bin /tmp/idriveforlinux.bin; \
     else \
-        sh /fetch-installer.sh "${IDRIVE_URL}" /tmp/idriveforlinux.bin; \
+        sh /idrive-fetch.sh "${IDRIVE_URL}" /tmp/idriveforlinux.bin '^#!'; \
     fi && \
     chmod a+x /tmp/idriveforlinux.bin && \
     printf 'A\n' | /tmp/idriveforlinux.bin --install && \

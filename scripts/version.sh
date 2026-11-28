@@ -4,25 +4,19 @@ set -eo pipefail
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 VERSION_URL="https://www.idrivedownloads.com/downloads/linux/download-for-linux/version-linux.js"
 
-# Extract the script version and its (cache-busted) download URL. IDrive's server sometimes
-# answers with something else (a web page, still HTTP 200), so a response without both values
-# is fetched again, up to 5 times, 15 s apart; curl prints its own diagnostic for HTTP and
-# network errors, which are retried the same way.
-for attempt in 1 2 3 4 5; do
-  RAW=$(curl -fsSL --connect-timeout 20 "$VERSION_URL") || RAW=""
-  VERSION=$(echo "$RAW" | grep -oP 'var\s+linuxScriptVersion\s*=\s*"Version\s+\K[0-9.]+(?=")' || true)
-  URL=$(echo "$RAW" | grep -oP "var\s+linuxScriptPackageURL\s*=\s*'\K[^']+(?=')" || true)
-  if [ -n "$VERSION" ] && [ -n "$URL" ]; then
-    break
-  fi
-  if [ "$attempt" = 5 ]; then
-    echo "Error: iDrive latest version or download URL not found at $VERSION_URL"
-    echo "It returned: $(printf '%s' "$RAW" | head -c 120 | tr -cd '[:print:]')"
-    exit 1
-  fi
-  echo "Attempt $attempt did not return IDrive's version and download URL; trying again in 15 s." >&2
-  sleep 15
-done
+# Extract the script version and its (cache-busted) download URL. idrive-fetch.sh retries when
+# IDrive's server answers with something else, and reports what came back.
+RAW_FILE=$(mktemp)
+trap 'rm -f "$RAW_FILE"' EXIT
+"$(dirname "$0")/idrive-fetch.sh" "$VERSION_URL" "$RAW_FILE" linuxScriptVersion
+RAW=$(cat "$RAW_FILE")
+VERSION=$(echo "$RAW" | grep -oP 'var\s+linuxScriptVersion\s*=\s*"Version\s+\K[0-9.]+(?=")' || true)
+URL=$(echo "$RAW" | grep -oP "var\s+linuxScriptPackageURL\s*=\s*'\K[^']+(?=')" || true)
+
+if [ -z "$VERSION" ] || [ -z "$URL" ]; then
+  echo "Error: iDrive latest version or download URL not found at $VERSION_URL"
+  exit 1
+fi
 
 echo "iDrive latest version: $VERSION"
 echo "iDrive download URL: $URL"

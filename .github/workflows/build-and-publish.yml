@@ -254,7 +254,7 @@ jobs:
             exit 1
           else
             mkdir -p .installer
-            ./scripts/fetch-installer.sh "$URL" "$f"
+            ./scripts/idrive-fetch.sh "$URL" "$f" '^#!'
             key=$KEY
             echo "save=true" >> "$GITHUB_OUTPUT"
           fi
