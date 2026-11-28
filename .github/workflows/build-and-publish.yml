@@ -2,7 +2,9 @@ name: Build and Publish
 
 # Builds the image and publishes it to GHCR (and Docker Hub when its secrets are set).
 #   decide:  resolve the current IDrive release and decide whether anything needs building
-#            (new IDrive version, new Debian base image, a change in this repo, or a manual run)
+#            (new IDrive version, new Debian base image, a change in this repo, or a manual run);
+#            when building, get IDrive's installer from the Actions cache, downloading it only
+#            for a release not cached yet, so builds rarely depend on IDrive's servers
 #   verify:  build each architecture on a native runner and run tests/smoke-test.sh against it
 #   build-and-push-docker-image: publish the version tag (main only, after verify passed) and
 #            move :latest once the release is old enough (LATEST_MIN_AGE_DAYS)
@@ -64,7 +66,8 @@ jobs:
     outputs:
       build: ${{ steps.decide.outputs.build }}
       reason: ${{ steps.decide.outputs.reason }}
-      idrive_version: ${{ steps.version.outputs.idrive_version }}
+      # From IDrive's version file, or (pull requests, when it does not answer) the cached installer.
+      idrive_version: ${{ steps.resolve.outputs.idrive_version || steps.installer.outputs.idrive_version }}
       idrive_URL: ${{ steps.version.outputs.idrive_URL }}
       idrive_release_date: ${{ steps.version.outputs.idrive_release_date }}
       idrive_age_days: ${{ steps.version.outputs.idrive_age_days }}
@@ -72,6 +75,7 @@ jobs:
       base_stale: ${{ steps.check-base.outputs.needs-updating }}
       version_tag: ${{ steps.check-version.outputs.tag }}
       revision: ${{ steps.revision.outputs.revision }}
+      installer_key: ${{ steps.installer.outputs.key }}
 
     steps:
       - name: Checkout code
@@ -90,7 +94,38 @@ jobs:
 
       - name: Get iDrive version
         id: version
+        continue-on-error: true
         run: ./scripts/version.sh
+
+      # IDrive's servers sometimes refuse GitHub's runners. When the version file does not
+      # answer, a pull request is tested with the newest installer in the cache, the daily run
+      # and a :latest rollback go ahead without it (nothing is built), and a push or manual
+      # build fails, as publishing needs the current release.
+      - name: Resolve iDrive release
+        id: resolve
+        env:
+          OUTCOME: ${{ steps.version.outcome }}
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ inputs.promote_version }}
+          VERSION: ${{ steps.version.outputs.idrive_version }}
+          URL: ${{ steps.version.outputs.idrive_URL }}
+        run: |
+          if [ "$OUTCOME" = success ]; then
+            {
+              echo "idrive_version=$VERSION"
+              # One cache entry per release: IDrive's link changes with every release.
+              echo "installer_key=idrive-installer-$VERSION-$(printf '%s' "$URL" | sha256sum | cut -c1-16)"
+            } >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = pull_request ]; then
+            echo "::warning::IDrive's version file did not answer; testing with the newest cached installer."
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = schedule ] || [ -n "$REQUESTED" ]; then
+            echo "::warning::IDrive's version file did not answer; nothing is built in this run."
+            echo "unreachable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::IDrive's version file did not answer; run this workflow again later."
+            exit 1
+          fi
 
       - name: Login to Github Packages (GHCR)
         if: github.event_name != 'pull_request'
@@ -107,8 +142,9 @@ jobs:
       # that pushed images but failed before creating its release leaves no git tag).
       - name: Compute image revision
         id: revision
+        if: steps.resolve.outputs.idrive_version != ''
         env:
-          VERSION: ${{ steps.version.outputs.idrive_version }}
+          VERSION: ${{ steps.resolve.outputs.idrive_version }}
           EVENT: ${{ github.event_name }}
         run: |
           rev=0
@@ -129,7 +165,7 @@ jobs:
 
       - name: Check if image exists in GHCR
         id: check-image
-        if: github.event_name != 'push' && github.event_name != 'pull_request'
+        if: github.event_name != 'push' && github.event_name != 'pull_request' && steps.resolve.outputs.unreachable != 'true'
         run: |
           # Redirects output to null. If it succeeds, the image exists. If it fails, it does not.
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:latest"
@@ -147,7 +183,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           repository: ${{ env.IMAGE_LOWERCASE }}
-          tag: ${{ steps.version.outputs.idrive_version }}
+          tag: ${{ steps.resolve.outputs.idrive_version }}
 
       # Check the base image against the current IDrive version tag (not :latest, which
       # lags behind by LATEST_MIN_AGE_DAYS and would otherwise rebuild on every daily run).
@@ -161,7 +197,7 @@ jobs:
         uses: lucacome/docker-image-update-checker@958e0b396cd5227e7da180826286ef48c20296f9 # v3.1.2
         with:
           base-image: debian:trixie-slim
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.version.outputs.idrive_version }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LOWERCASE }}:${{ steps.resolve.outputs.idrive_version }}
 
       # Single source of truth for the build decision; the Build Summary below reads
       # the same outputs rather than restating the condition.
@@ -173,9 +209,11 @@ jobs:
           IMAGE_EXISTS: ${{ steps.check-image.outputs.exists }}
           BASE_STALE: ${{ steps.check-base.outputs.needs-updating }}
           VERSION_TAG: ${{ steps.check-version.outputs.tag }}
+          UNREACHABLE: ${{ steps.resolve.outputs.unreachable }}
         run: |
           build=false
           if   [ -n "$REQUESTED" ];            then reason="rollback request; nothing to build"
+          elif [ "$UNREACHABLE" = "true" ];    then reason="IDrive's version file did not answer; trying again on the next run"
           elif [ "$EVENT" = "push" ];          then build=true; reason="push to main"
           elif [ "$EVENT" = "pull_request" ];  then build=true; reason="pull request (test only, no push)"
           elif [ "$EVENT" = "workflow_dispatch" ]; then build=true; reason="manual dispatch"
@@ -187,6 +225,52 @@ jobs:
           echo "build=$build"   >> "$GITHUB_OUTPUT"
           echo "reason=$reason" >> "$GITHUB_OUTPUT"
           echo "build=$build ($reason)"
+
+      - name: Restore iDrive's installer from the cache
+        id: installer-cache
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: .installer/idriveforlinux.bin
+          key: ${{ steps.resolve.outputs.installer_key || 'idrive-installer-unknown' }}
+          # Only without IDrive's version file: take the newest installer cached for any release.
+          restore-keys: ${{ steps.resolve.outputs.fallback == 'true' && 'idrive-installer-' || '' }}
+
+      - name: Get iDrive's installer
+        id: installer
+        if: steps.decide.outputs.build == 'true'
+        env:
+          MATCHED: ${{ steps.installer-cache.outputs.cache-matched-key }}
+          KEY: ${{ steps.resolve.outputs.installer_key }}
+          URL: ${{ steps.version.outputs.idrive_URL }}
+          FALLBACK: ${{ steps.resolve.outputs.fallback }}
+        run: |
+          f=.installer/idriveforlinux.bin
+          if [ -n "$MATCHED" ]; then
+            echo "Using the cached installer ($MATCHED)."
+            key=$MATCHED
+          elif [ "$FALLBACK" = "true" ]; then
+            echo "::error::IDrive's version file did not answer and no installer is cached; run this workflow again later."
+            exit 1
+          else
+            mkdir -p .installer
+            ./scripts/fetch-installer.sh "$URL" "$f"
+            key=$KEY
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+          version=$(head -c 4096 "$f" | sed -n 's/^APPVERSION="\([0-9.]*\)"$/\1/p' | head -n 1)
+          echo "Installer version: ${version:-unknown}"
+          {
+            echo "key=$key"
+            echo "idrive_version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Save iDrive's installer to the cache
+        if: steps.installer.outputs.save == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .installer/idriveforlinux.bin
+          key: ${{ steps.installer.outputs.key }}
 
   # Build each architecture on a native runner and run the smoke test before anything
   # is published. ubuntu-24.04-arm is free for public repositories; a private fork
@@ -212,6 +296,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Restore iDrive's installer
+        uses: actions/cache/restore@v6
+        with:
+          path: .installer/idriveforlinux.bin
+          key: ${{ needs.decide.outputs.installer_key }}
+          fail-on-cache-miss: true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -220,6 +311,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-contexts: installer=./.installer
           build-args: IDRIVE_URL=${{ needs.decide.outputs.idrive_URL }}
           tags: idrive-docker:smoke
           load: true
@@ -235,6 +327,7 @@ jobs:
       always() &&
       github.event_name != 'pull_request' &&
       needs.decide.result == 'success' &&
+      (needs.decide.outputs.idrive_version != '' || inputs.promote_version != '') &&
       (needs.verify.result == 'success' || needs.verify.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
@@ -282,6 +375,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Restore iDrive's installer
+        if: needs.decide.outputs.build == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: .installer/idriveforlinux.bin
+          key: ${{ needs.decide.outputs.installer_key }}
+          fail-on-cache-miss: true
+
       - name: Generate Dynamic Docker Tags
         id: generate-tags
         if: needs.decide.outputs.build == 'true'
@@ -324,6 +425,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-contexts: installer=./.installer
           tags: ${{ steps.generate-tags.outputs.tags }}
           # Passed as a buildkit input (not evaluated by a runner shell). version.sh
           # exits non-zero if the URL is unresolved, so we never reach here empty.

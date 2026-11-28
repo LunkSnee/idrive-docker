@@ -2,3 +2,4 @@
 # so local .env files, secrets and git metadata never reach the build.
 *
 !docker/
+!scripts/fetch-installer.sh

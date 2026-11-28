@@ -10,6 +10,11 @@
 #   which restores missing files from idriveIt.orig.tar.gz into the persistent config volume.
 # - .image_version records the IDrive version this image installed.
 
+# IDrive's installer, when the build is given one: CI passes its cached copy as the "installer"
+# build context (--build-context installer=<dir>), so it does not depend on IDrive's download
+# link answering. A plain `docker build` leaves this stage empty and the installer is downloaded.
+FROM scratch AS installer
+
 FROM debian:trixie-slim
 
 ARG TARGETPLATFORM
@@ -55,27 +60,23 @@ ARG INCLUDE_CLOUD_DRIVE=false
 # - The installer refuses to run without `crontab`. IDrive brings its own scheduler
 #   (/etc/idrivecron), so a temporary stub satisfies the check without installing cron and
 #   systemd and is removed in the same layer.
-# - IDrive's download link sometimes answers with a web page instead of the installer (still
-#   HTTP 200, so curl -f cannot tell). The installer is a shell script, so anything not starting
-#   with "#!" is downloaded again, up to 5 times, and then fails with what came back.
+# - The installer comes from the "installer" build context when given, otherwise from IDRIVE_URL
+#   via scripts/fetch-installer.sh, which retries when IDrive's link answers with a web page.
 # - printf, not `echo -en`: RUN uses dash, whose echo prints -en literally. The installer is the
 #   last command in its pipe, so its exit status already fails the build.
 # hadolint ignore=DL4006
-RUN case "$INCLUDE_CLOUD_DRIVE" in true|false) ;; \
+RUN --mount=type=bind,source=scripts/fetch-installer.sh,target=/fetch-installer.sh \
+    --mount=type=bind,from=installer,target=/installer \
+    case "$INCLUDE_CLOUD_DRIVE" in true|false) ;; \
         *) echo "INCLUDE_CLOUD_DRIVE must be true or false" >&2; exit 1 ;; esac && \
     printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/crontab && \
     chmod +x /usr/local/bin/crontab && \
-    for attempt in 1 2 3 4 5; do \
-        curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
-            -o /tmp/idriveforlinux.bin "${IDRIVE_URL}" && \
-            [ "$(head -c 2 /tmp/idriveforlinux.bin)" = '#!' ] && break; \
-        if [ "$attempt" = 5 ]; then \
-            echo "IDrive's download link did not return its installer. It returned: $(head -c 120 /tmp/idriveforlinux.bin 2>/dev/null | tr -cd '[:print:]')" >&2; \
-            exit 1; \
-        fi; \
-        echo "Download attempt $attempt did not return IDrive's installer; trying again in 15 s." >&2; \
-        sleep 15; \
-    done && \
+    if [ -f /installer/idriveforlinux.bin ]; then \
+        echo "Using the given IDrive installer." && \
+        cp /installer/idriveforlinux.bin /tmp/idriveforlinux.bin; \
+    else \
+        sh /fetch-installer.sh "${IDRIVE_URL}" /tmp/idriveforlinux.bin; \
+    fi && \
     chmod a+x /tmp/idriveforlinux.bin && \
     printf 'A\n' | /tmp/idriveforlinux.bin --install && \
     rm -rf /tmp/* /var/tmp/* /usr/local/bin/crontab \
