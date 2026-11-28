@@ -9,7 +9,7 @@ On top of the plain IDrive client, this image:
 - **Stays logged in across restarts, host reboots and image upgrades.** IDrive logs itself out when it thinks the machine changed; the container updates the state IDrive checks before it starts.
 - **Can log in by itself** (optional): first-time setup and re-login from Docker secrets, including two-factor authentication (2FA) codes from an authenticator-app setup key.
 - **Recovers from logouts while running**: a watchdog notices and restarts the container to log in again, with backoff so it can never lock your account.
-- **Reports real health** in `docker ps`: `(healthy)` means IDrive's service is running *and* (once configured or with credentials provided) logged in with an active schedule.
+- **Reports real health** in `docker ps`: `(healthy)` means IDrive's service is running *and* (once configured or with credentials provided) logged in with an active schedule whose last 3 scheduled backups did not all fail.
 - **Keeps `docker logs` readable**: filters out IDrive's bulk file-list chatter by default and adds concise `[job]` summary and progress lines.
 - **Updates IDrive through new images**, not by patching itself inside the container (which would log you out).
 
@@ -200,6 +200,7 @@ docker compose pull && docker compose up -d
 | Symptom | What to do |
 |---------|------------|
 | `docker ps` shows `(unhealthy)` | Run `docker exec idrive idrive-init.py healthcheck` for the exact reason (prints nothing when healthy). |
+| `the last 3 scheduled backups failed` | Backups have stopped working while IDrive is logged in (for example a source folder no longer mounted, a full quota, or a changed encryption key). The `[job]` lines in `docker logs` and `docker exec -it idrive idrive --logs` show why; the container is healthy again after the next successful scheduled backup. |
 | `WARNING: IDrive's config (...) is on an anonymous Docker volume` | Mount a named volume (`idrive:/opt/IDriveForLinux/idriveIt`) or host bind mount so `docker compose down` does not erase your login and schedule. |
 | `RMSH is empty in CONFIGURATION_FILE` | Logins created by older IDrive releases lack `RMSH`, which IDrive `3.17.1+` validates; run `docker exec -it idrive idrive --login` once. |
 | Log says `automated login paused after: ...` | Fix the password, 2FA key, or setting and restart, or run `docker exec idrive idrive-init.py reset-login && docker restart idrive`. |

@@ -452,8 +452,9 @@ def collect_health_state() -> tuple[bool, str]:
     Always: IDrive's service (/etc/idrivecron) runs and the volume records the image's IDrive
     version. Once an account is set up, also: it is logged in (isLoggedin=1, which IDrive
     itself sets to 0 on any logout), its saved-password files exist (and both private key
-    files, once either exists), and its schedule is not INACTIVE. Checking only the process
-    is not enough: it keeps running after a logout.
+    files, once either exists), its schedule is not INACTIVE, and its last
+    FAILED_BACKUPS_UNHEALTHY scheduled backups did not all fail. Checking only the process
+    is not enough: it keeps running after a logout, and while every backup fails.
 
     Costs two decrypts (cache/idriveuser.txt, idrivecrontab.json).
     """
@@ -511,7 +512,48 @@ def collect_health_state() -> tuple[bool, str]:
     cron_data, _ = decrypt_json_file(CRONTAB_FILE)
     if (get_cron_status(cron_data, user_id) or "").upper() == "INACTIVE":
         return False, "backup schedule is INACTIVE"
+    failed = failed_scheduled_backups(pdir)
+    if failed:
+        return False, (f"the last {FAILED_BACKUPS_UNHEALTHY} scheduled backups failed (newest: {failed}); "
+                       "see the [job] lines in docker logs, or `idrive --logs`")
     return True, "ok"
+
+
+# The container is unhealthy when this many finished scheduled backups in a row failed: one
+# failure can be a flaky run, but a streak means backups have stopped (an expired key, a missing
+# source mount, a full quota) while IDrive still runs and is logged in.
+FAILED_BACKUPS_UNHEALTHY = 3
+
+
+def failed_scheduled_backups(pdir: str) -> str:
+    """Name of the newest job log when the last FAILED_BACKUPS_UNHEALTHY finished scheduled
+    backups all failed, else "". Manual jobs do not count, and neither does a "Failure" that is
+    only IDrive's negative failed count (see summarize_job_log): that backup worked."""
+    logs = []
+    for path in glob.glob(os.path.join(pdir, "Backup", "*", "LOGS", "*_Scheduled")):
+        parts = os.path.basename(path).split("_")
+        if len(parts) == 3 and parts[0].isdigit() and parts[1] != "Running":
+            logs.append((int(parts[0]), parts[1], path))
+    newest = sorted(logs, reverse=True)[:FAILED_BACKUPS_UNHEALTHY]
+    if len(newest) < FAILED_BACKUPS_UNHEALTHY:
+        return ""
+    for _, status, path in newest:
+        if status != "Failure" or negative_failed_count(path):
+            return ""
+    return os.path.basename(newest[0][2])
+
+
+def negative_failed_count(path: str) -> bool:
+    """True when the job log's [SUMMARY:] reports a negative "Files failed" count. Only the end of
+    the log is read: the summary is last, and a failed job's log can be long."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(os.path.getsize(path) - 65536, 0))
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    m = re.search(r"^Files failed to [^:\n]+\s*:\s*(-?[\d,]+)", tail, re.M)
+    return bool(m) and int(m.group(1).replace(",", "")) < 0
 
 
 def cmd_healthcheck() -> int:

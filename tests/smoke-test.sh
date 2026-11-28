@@ -169,8 +169,25 @@ for f in IDPVT IDPVT_SCH; do printf dummy > "$u/$f"; done; idrive-init.py health
 unhealthy_after "a missing private key file" "rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT_SCH"
 docker exec "$c" rm /opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/.userInfo/IDPVT
 docker exec "$c" idrive-init.py healthcheck || fail "health check failed without private key files"
+# Three finished scheduled backups that failed in a row make it unhealthy. Manual jobs, IDrive's
+# negative failed count on a backup that worked, and a newer success do not.
+docker exec "$c" bash -c '
+set -euo pipefail
+l=/opt/IDriveForLinux/idriveIt/user_profile/root/smokeuser/Backup/DefaultBackupSet/LOGS
+mkdir -p "$l"
+job() { printf "[SUMMARY:]\nFiles considered for backup : 10\nFiles backed up now : 0\nFiles failed to backup : %s\n" "$3" > "$l/$1_$2"; }
+job 1795000001 Failure_Scheduled 5; job 1795000002 Failure_Scheduled 5; job 1795000003 Failure_Manual 5
+job 1795000004 Failure_Scheduled -2; job 1795000005 Failure_Scheduled 5; job 1795000006 Running_Scheduled 0
+idrive-init.py healthcheck                          # newest three: 05, 04 (negative count: it worked), 02
+job 1795000007 Failure_Scheduled 5; job 1795000008 Failure_Scheduled 5
+out=$(idrive-init.py healthcheck 2>&1) && exit 1
+grep -q "last 3 scheduled backups failed (newest: 1795000008_Failure_Scheduled)" <<<"$out"
+job 1795000009 Success_Scheduled 0
+idrive-init.py healthcheck
+rm -rf "$l"
+' || fail "health check and failed scheduled backups"
 unhealthy_after "INACTIVE schedule" "$enc; enc '{\"root\":{\"smokeuser\":{\"otherInfo\":{\"settings\":{\"status\":\"INACTIVE\"}}}}}' /opt/IDriveForLinux/idriveIt/idrivecrontab.json"
-echo "[6] Health check catches a logout, missing password/private keys and an INACTIVE schedule"
+echo "[6] Health check catches a logout, missing password/private keys, failing backups and an INACTIVE schedule"
 
 # 7. When IDrive hangs, the health check still ends within its budget, inside Docker's
 #    timeout, and leaves no decrypt behind (a slow check must never orphan an idrive process).

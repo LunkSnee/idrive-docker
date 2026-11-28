@@ -110,8 +110,9 @@ COPY --chmod=755 docker/start.sh /start.sh
 VOLUME ["/opt/IDriveForLinux/idriveIt"]
 
 # Healthy = IDrive's service runs and, once an account is set up, it is logged in with an
-# active schedule (see collect_health_state in docker/idrive-init.py). The check keeps its
-# own commands within 40 s, well inside the 60 s timeout.
+# active schedule, and its last 3 scheduled backups did not all fail (see collect_health_state
+# in docker/idrive-init.py). The check keeps its own commands within 40 s, well inside the 60 s
+# timeout.
 HEALTHCHECK --interval=2m --timeout=60s --start-period=60s --retries=3 \
     CMD ["/usr/local/bin/idrive-init.py", "healthcheck"]
 
