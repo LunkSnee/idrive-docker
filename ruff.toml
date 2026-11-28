@@ -1,0 +1,8 @@
+# Ruff settings for docker/idrive-init.py (runs on the image's Python 3.13).
+target-version = "py313"
+# Long lines are mostly log messages and regular expressions; keep them whole.
+line-length = 170
+
+[lint]
+# pycodestyle errors, pyflakes, bugbear, pyupgrade
+select = ["E", "F", "B", "UP"]

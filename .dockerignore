@@ -1,0 +1,4 @@
+# The build context is the repository root: send only what the Dockerfile copies,
+# so local .env files, secrets and git metadata never reach the build.
+*
+!docker/

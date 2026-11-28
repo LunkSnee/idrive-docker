@@ -1,0 +1,48 @@
+[DETAILS]
+---------
+[Version: 3.17.1] [Release Date: 11-18-2026] [Job type: Interactive backup] [Username: user@example.com] 
+[Failed files(%): 5] [Machine Name: pr9-live] 
+[Backup location: E2E-Test-pr9] [Throttle Value(%): 100] 
+[Ignore file/folder level permission errors: enabled]
+[Backup Set: DefaultBackupSet_root]
+
+
+Backup Start Time: Thu Nov 26 14:39:46 2026
+
+[BACKUP SET CONTENT]
+--------------------
+[Directories]
+/source/1
+
+[EXCLUDE SET]
+-------------
+[Default excluded items:]
+    /proc/
+    /sys/
+    /opt/IDriveForLinux/bin/
+    /opt/IDriveForLinux/idriveIt/
+
+[Propagated exclude items:]
+    No item.
+
+[User excluded items:]
+    No item.
+
+[Exclude hidden files/folders: Disabled]
+
+Total excluded files: 0
+
+[      BACKUP TIME       ] [STATUS ] [   BACKUP  ] [ FILE NAME ] [ FILE SIZE ]
+------------------------------------------------------------------------------
+[Thu Nov 26 14:39:50 2026] [SUCCESS] [    FULL   ] [/source/1/b.txt] [2 bytes]
+[Thu Nov 26 14:39:50 2026] [SUCCESS] [    FULL   ] [/source/1/docs/a.txt] [2 bytes]
+
+
+[SUMMARY:] 
+---------
+Files considered for backup : 2
+Files backed up now : 2 [Added(2) / modified(0)] [Size of backed up files: 4 bytes]
+Files already present in your account : 0
+Files failed to backup : 0
+Backup End Time : Thu Nov 26 14:39:54 2026
+

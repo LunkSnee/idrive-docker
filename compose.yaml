@@ -1,0 +1,43 @@
+services:
+  idrive:
+    # Pin a version tag for unattended backups, e.g. :3.17.1-r1 (see "Which image tag to use" in the README).
+    image: ghcr.io/lunksnee/idrive-docker:latest
+    # Uncomment to build locally instead of pulling from GHCR (see README for --build-arg options):
+    # build: .
+    container_name: idrive
+    # Keep the hostname stable: IDrive names this device after it in your account.
+    hostname: idrive-backup
+    volumes:
+      - idrive:/opt/IDriveForLinux/idriveIt
+      # Or a host folder instead of the named volume:
+      # - /path/to/config:/opt/IDriveForLinux/idriveIt
+      - /path/to/backup:/source/1:ro
+      # Writable folder to restore files into:
+      # - /path/to/restore:/restore
+    restart: unless-stopped
+    # Matches start.sh's 6s graceful drain before stopping idrivecron cleanly.
+    stop_grace_period: 15s
+    # TZ and the other settings come from .env (copy .env.example to .env; optional).
+    env_file:
+      - path: .env
+        required: false
+    # Automated login: uncomment the secrets you use here and at the bottom, and the
+    # matching IDRIVE_*_FILE lines in .env.
+    # secrets:
+    #   - idrive_account
+    #   - idrive_password
+    #   - idrive_totp_secret
+    #   - idrive_encryption_key
+
+volumes:
+  idrive:
+
+# secrets:
+#   idrive_account:
+#     file: ./secrets/idrive_account
+#   idrive_password:
+#     file: ./secrets/idrive_password
+#   idrive_totp_secret:
+#     file: ./secrets/idrive_totp_secret
+#   idrive_encryption_key:
+#     file: ./secrets/idrive_encryption_key

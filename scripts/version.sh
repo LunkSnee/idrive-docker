@@ -1,6 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 VERSION_URL="https://www.idrivedownloads.com/downloads/linux/download-for-linux/version-linux.js"
 
 # Extract the script version and its (cache-busted) download URL. curl -f makes an
@@ -17,8 +18,8 @@ fi
 
 echo "iDrive latest version: $VERSION"
 echo "iDrive download URL: $URL"
-echo "idrive_version=$VERSION" >> $GITHUB_OUTPUT
-echo "idrive_URL=$URL" >> $GITHUB_OUTPUT
+echo "idrive_version=$VERSION" >> "$GITHUB_OUTPUT"
+echo "idrive_URL=$URL" >> "$GITHUB_OUTPUT"
 
 # Release date, used to hold the :latest tag back until a release has had time to
 # surface problems, rather than following a brand-new version the day it appears.
@@ -31,8 +32,8 @@ REL_ISO=$(printf '%s' "$REL_DATE" | awk -F/ 'NF==3{printf "%s-%s-%s", $3, $1, $2
 if [ -n "$REL_ISO" ] && REL_EPOCH=$(date -u -d "$REL_ISO" +%s 2>/dev/null); then
   AGE_DAYS=$(( ( $(date -u +%s) - REL_EPOCH ) / 86400 ))
   echo "iDrive release date: $REL_ISO (${AGE_DAYS} days ago)"
-  echo "idrive_release_date=$REL_ISO" >> $GITHUB_OUTPUT
-  echo "idrive_age_days=$AGE_DAYS" >> $GITHUB_OUTPUT
+  echo "idrive_release_date=$REL_ISO" >> "$GITHUB_OUTPUT"
+  echo "idrive_age_days=$AGE_DAYS" >> "$GITHUB_OUTPUT"
 else
   # Deliberately leave idrive_age_days unset. The workflow treats an unknown age as
   # "do not move :latest", so a format change here freezes :latest on the last known

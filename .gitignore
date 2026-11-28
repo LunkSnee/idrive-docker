@@ -1,11 +1,14 @@
 # Local docker-compose overrides
 docker-compose.override.yml
 docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
 
 # Local environment / secrets
 .env
 .env.*
 !.env.example
+secrets/
 
 # Local iDrive config or backup data pulled out of a container
 idriveIt/
@@ -19,3 +22,7 @@ idriveIt/
 *~
 .DS_Store
 Thumbs.db
+
+# Python bytecode
+__pycache__/
+*.py[cod]

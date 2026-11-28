@@ -1,0 +1,3 @@
+# Debian package versions change with every point release; pinning them would break rebuilds.
+ignored:
+  - DL3008
