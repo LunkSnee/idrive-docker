@@ -9,6 +9,18 @@ set -euo pipefail
 
 echo "Initializing IDrive container..."
 
+# 0. Time zone for every process. IDrive starts its continuous-backup services (file watcher,
+#    database writer, CDP client and server) without the container's TZ, so they fall back to
+#    /etc/localtime, which is UTC in the image; point it at TZ so their log lines use local time.
+if [ -n "${TZ:-}" ]; then
+    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+        echo "$TZ" > /etc/timezone
+    else
+        echo "WARNING: unknown time zone TZ=$TZ; IDrive's services use UTC." >&2
+    fi
+fi
+
 # 1. Bring the persistent volume in line with this image before IDrive starts: restore
 #    missing defaults, refresh the idevsutil programs, record the IDrive version, and fix the
 #    state that would otherwise make IDrive log out (see docker/idrive-init.py, cmd_prepare).

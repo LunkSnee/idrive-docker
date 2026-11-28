@@ -68,10 +68,11 @@ pgrep -f /etc/idrivecron >/dev/null
 [ -x /opt/IDriveForLinux/idriveIt/idevsutil ]
 [ "$(cat /opt/IDriveForLinux/idriveIt/cache/version)" = "$EXPECT_VER" ]
 [ "$(date +%Z)" = EST ] || [ "$(date +%Z)" = EDT ]
+tz=$(env -u TZ date +%Z); [ "$tz" = EST ] || [ "$tz" = EDT ]   # processes started without TZ
 [ ! -e /opt/IDriveForLinux/idriveIt/cache/.updateVersionInfo ]
 idrive-init.py healthcheck
 ' || fail "fresh start checks"
-echo "[3] Fresh volume: service running, volume populated, TZ applied, healthy while waiting for setup"
+echo "[3] Fresh volume: service running, volume populated, TZ applied (also without TZ), healthy while waiting for setup"
 if logs_contain "$c" "anonymous Docker volume"; then fail "anonymous-volume warning on a named volume"; fi
 c="${RUN_ID}-anon"
 CONTAINERS+=("$c")
