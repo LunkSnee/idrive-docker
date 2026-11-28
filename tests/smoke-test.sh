@@ -74,6 +74,7 @@ idrive-init.py healthcheck
 ' || fail "fresh start checks"
 echo "[3] Fresh volume: service running, volume populated, TZ applied (also without TZ), healthy while waiting for setup"
 if logs_contain "$c" "anonymous Docker volume"; then fail "anonymous-volume warning on a named volume"; fi
+logs_contain "$c" "tz=America/New_York local_time=" || fail "the [init] Summary line does not show the time zone"
 c="${RUN_ID}-anon"
 CONTAINERS+=("$c")
 docker run -d --name "$c" "$IMAGE" >/dev/null   # nothing mounted: Docker uses an anonymous volume

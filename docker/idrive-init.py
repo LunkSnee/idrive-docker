@@ -438,7 +438,8 @@ def cmd_prepare(quiet: bool = False) -> int:
             f"version={version} configured={bool(user_id and cfg_stats['profiles'])} "
             f"logged_in={logged_in == 1} rmws={cfg_stats['rmws']} cron_status={cron_status} "
             f"uptime_synced={cfg_stats['uptime_synced']} launch_update_disabled={launch_update_disabled} "
-            f"stale_pids_cleaned={stale_removed}"
+            f"stale_pids_cleaned={stale_removed} tz={os.environ.get('TZ') or 'unset'} "
+            f"local_time={time.strftime('%Y-%m-%d %H:%M %Z')}"
         )
     return 0
 

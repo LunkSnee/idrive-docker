@@ -201,6 +201,8 @@ docker compose pull && docker compose up -d
 |---------|------------|
 | `docker ps` shows `(unhealthy)` | Run `docker exec idrive idrive-init.py healthcheck` for the exact reason (prints nothing when healthy). |
 | `the last 3 scheduled backups failed` | Backups have stopped working while IDrive is logged in (for example a source folder no longer mounted, a full quota, or a changed encryption key). The `[job]` lines in `docker logs` and `docker exec -it idrive idrive --logs` show why; the container is healthy again after the next successful scheduled backup. |
+| Log or schedule times are hours off | Check `tz=` and `local_time=` in the `[init] Summary:` line. With `TZ=${TZ}` under `environment:` in your compose file, a `TZ` set in the shell or deploy tool that runs Compose overrides `.env`; this image's `compose.yaml` loads `.env` with `env_file:`, which is not affected. |
+| Excluded files are still backed up | IDrive applies exclude lists changed in its editor once it refreshes its file database. In `docker exec -it idrive idrive --edit-job-sets`, switch the hidden-files exclusion off and on again to make it refresh. |
 | `WARNING: IDrive's config (...) is on an anonymous Docker volume` | Mount a named volume (`idrive:/opt/IDriveForLinux/idriveIt`) or host bind mount so `docker compose down` does not erase your login and schedule. |
 | `RMSH is empty in CONFIGURATION_FILE` | Logins created by older IDrive releases lack `RMSH`, which IDrive `3.17.1+` validates; run `docker exec -it idrive idrive --login` once. |
 | Log says `automated login paused after: ...` | Fix the password, 2FA key, or setting and restart, or run `docker exec idrive idrive-init.py reset-login && docker restart idrive`. |
